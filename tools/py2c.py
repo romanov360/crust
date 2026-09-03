@@ -5622,6 +5622,8 @@ class Transpiler:
         self.closure_specs = lift_nested_functions(tree)
         self.closure_specs.update(convert_block_closures(tree))
         self.closure_values_needed = set()
+        self.lambda_specs = {}
+        self.lambda_values_needed = set()
         self.classes, self.class_order, vt = collect_classes(tree)
         self.ambiguous = ambiguous_class_names(self.base_dir)
         self.ambiguous_funcs = set(ambiguous_function_names(self.base_dir))
@@ -5936,6 +5938,8 @@ class Transpiler:
                   for fn in sorted(self.func_values_needed)]
         tramps += ["static obj %s__tramp(obj, obj);" % cname(m)
                    for m in sorted(self.closure_values_needed)]
+        tramps += ["static obj %s__tramp(obj, obj);" % m
+                   for m in sorted(self.lambda_values_needed)]
         def _tramp_sym(c):
             cci = self.classes.get(c) or (self.xclasses[c][0]
                                           if c in self.xclasses else None) \
@@ -9204,6 +9208,42 @@ class Transpiler:
                 self.emit("return OBJ_OBJ(%s);" % call)
             else:
                 self.emit("return %s;" % call)
+            self.indent -= 1
+            self.emit("}")
+            self.emit()
+        # lambdas: env holds the captured free variables (in the order
+        # `_lambda_free_vars` returned, matching how `ex_Lambda` built the
+        # list), args holds the lambda's own parameters -- always `obj`,
+        # since a lambda's parameters can carry no annotation to type them
+        # from. `self.scope`/`self.cur_class` are restored to what they
+        # were at the point this lambda was created, not left over from
+        # whatever function was transpiled last -- `expr()` on the body
+        # needs the same names in scope this time as it did then.
+        for mangled in sorted(self.lambda_values_needed):
+            node, free, cap_ctypes, cur_class = self.lambda_specs[mangled]
+            saved_scope, saved_class = self.scope, self.cur_class
+            self.scope, self.cur_class = {}, cur_class
+            parts = []
+            for i, name in enumerate(free):
+                ct = cap_ctypes.get(name, OBJ)
+                self.scope[name] = ct
+                parts.append("%s %s = %s;" % (
+                    ct, self.pname(name),
+                    self._coerce_obj_to("index_obj(env, %d)" % i, ct)))
+            for j, param in enumerate(node.args.args):
+                self.scope[param.arg] = OBJ
+                parts.append("obj %s = index_obj(args, %d);" %
+                             (self.pname(param.arg), j))
+            try:
+                body = self.wrap_obj(node.body)
+            finally:
+                self.scope, self.cur_class = saved_scope, saved_class
+            self.emit("static obj %s__tramp(obj env, obj args) {" % mangled)
+            self.indent += 1
+            self.emit("(void)env; (void)args;")
+            for p in parts:
+                self.emit(p)
+            self.emit("return %s;" % body)
             self.indent -= 1
             self.emit("}")
             self.emit()
@@ -15244,6 +15284,20 @@ class Transpiler:
         if target in ("int", "long") and \
                 self._scalar_helper_ct(rendered) is not None:
             return rendered
+        # A call to a void-returning runtime primitive -- `list.append`,
+        # `.sort()`, `dict[k] = v`, ... -- used as a *value*. Its Python
+        # return value is always None, but `value_ctype` has no case for
+        # these (nothing needs one: as a bare statement the C is already
+        # correct), so without this `target == vt` below fell through to
+        # "already the right shape" and handed back a `void` expression
+        # wherever the None was actually consumed -- `return
+        # lst.append(x)`, or a lambda whose whole body is the call (a
+        # `record` callback exists purely for this side effect: see
+        # `_monomorphise_uses`'s `record` parameter in cpprust.py) --
+        # which does not compile ("void value not ignored as it ought to
+        # be"). Sequenced through a statement expression instead.
+        if self._void_call_ct(rendered):
+            return "({ %s; OBJ_NONE; })" % rendered
         if target == vt:
             return rendered
         if target == OBJ:
@@ -15302,6 +15356,24 @@ class Transpiler:
     # py2c chose does, exactly.
     _SCALAR_HELPERS = ("str_find_from(", "str_find_range(", "str_count(")
 
+    # Runtime primitives that mutate in place and return C `void`, for the
+    # in-place list/dict/set methods Python always types as returning
+    # `None`: `.append`, `.insert`, `.extend`, `xs[i] = v`, `dict.update`,
+    # `d[k] = v`, `.sort`, `.add` (set), `.clear`, `.remove`, `xs[:] = ..`,
+    # `xs[a:b] = ..`, `del c[k]`. Keyed on the emitted call for the same
+    # reason `_SCALAR_HELPERS` is: nothing about the Python receiver's
+    # static type says which of these a `.something(...)` call became.
+    _VOID_HELPERS = (
+        "list_append(", "list_insert(", "list_extend(", "list_set(",
+        "dict_set(", "dict_update(", "subscript_set(", "list_sort(",
+        "set_add(", "pyclear(", "list_remove(", "list_assign_slice(",
+        "list_set_slice(", "del_item(", "rt_setattr(")
+
+    def _void_call_ct(self, rendered):
+        """True if `rendered` is a call to one of `_VOID_HELPERS`."""
+        return isinstance(rendered, str) and rendered.startswith(
+            self._VOID_HELPERS)
+
     def _is_nameless_env(self, node):
         """A literal dict that binds no name an expression could read.
 
@@ -15355,6 +15427,11 @@ class Transpiler:
             _rendered = self.expr(node)
             if self._scalar_helper_ct(_rendered) is not None:
                 return "OBJ_INT(%s)" % _rendered
+            # See `coerce_to`: a void-returning mutator (`.append`, `.sort`,
+            # ...) used as a value -- its Python return is always None, but
+            # the C call itself has nothing to hand back.
+            if self._void_call_ct(_rendered):
+                return "({ %s; OBJ_NONE; })" % _rendered
         if self.is_obj_word(node) or self.value_ctype(node) == OBJ:
             return _rendered if _rendered is not None else self.expr(node)
         t = self.value_ctype(node)
@@ -16665,11 +16742,94 @@ class Transpiler:
         return self.lower_comp(node, "list")
 
     def ex_Lambda(self, node):
+        """A lambda used as a first-class value -- handed to an ordinary
+        function, assigned, or immediately invoked.
+
+        `.sort(key=lambda ...)` inlines the lambda's body directly
+        (`_sort_with_key`), and `re.sub`'s function-replacement form names
+        a real function rather than an inline lambda in every call site
+        this codebase has; neither ever calls `self.expr()` on a `Lambda`
+        node, so neither is affected by what happens here. This is only
+        reached for the general case, and until now it unconditionally
+        returned the identity closure -- silently replacing the lambda's
+        actual body with `lambda x: x` for anything more than that one
+        trivial shape. See RPYTHON_CPPRUST.md: `_sub_code`'s field-
+        qualification callback, `lambda m: "this->" + info["paths"][...]`,
+        is exactly this, and every class with a field used unqualified in
+        a method body went through it.
+
+        Mirrors `convert_block_closures`'s nested-def closures: free
+        variables the body reads out of the enclosing function -- found
+        via `self.scope`, which holds exactly the locals/params visible at
+        this point in that function -- travel in a captured environment
+        list, and `emit_trampolines` emits a uniform-signature wrapper
+        (registered now, emitted later, once every function body has been
+        walked) that unpacks env and args and evaluates the body itself.
+        """
         if len(node.args.args) == 1 and isinstance(node.body, ast.Name) and \
                 node.body.id == node.args.args[0].arg and \
-                not node.args.vararg and not node.args.kwarg:
+                not node.args.vararg and not node.args.kwarg and \
+                not node.args.posonlyargs and not node.args.kwonlyargs:
             return "make_closure(&identity__tramp, OBJ_NONE)"
-        return "make_closure(&identity__tramp, OBJ_NONE)"
+        free = self._lambda_free_vars(node)
+        # `self` is captured by class-pointer ctype rather than looked up
+        # in `self.scope` -- see `_lambda_free_vars` -- it is never a key
+        # there for a method body.
+        cap_ctypes = dict(
+            (n, self.scope[n] if n in self.scope
+             else self.cur_class.csym + "*") for n in free)
+        self._lambda_ctr = getattr(self, "_lambda_ctr", 0) + 1
+        mangled = cname("%s__lambda%d" % (self.modname, self._lambda_ctr))
+        # `self.cur_class` travels too: a lambda defined inside a method
+        # and capturing `self` needs it in scope again when its body is
+        # actually evaluated, in `emit_trampolines`, well after the method
+        # that defined it has finished being processed.
+        self.lambda_specs[mangled] = (node, free, cap_ctypes, self.cur_class)
+        self.lambda_values_needed.add(mangled)
+        env = self._list_literal(
+            [self.wrap_obj(ast.copy_location(
+                ast.Name(id=n, ctx=ast.Load()), node)) for n in free])
+        return "make_closure(&%s__tramp, %s)" % (mangled, env)
+
+    def _lambda_free_vars(self, node):
+        """Names loaded in a lambda's body that are locals of the
+        enclosing function -- present in `self.scope` -- and not the
+        lambda's own parameters: what has to travel in the captured
+        environment. Stops at a nested lambda/def's own boundary, exactly
+        as `convert_block_closures` does for a nested `def`: a name it
+        captures is its own concern, not this one's.
+
+        `self` is a special case: a method's own receiver is never in
+        `self.scope` (`enter_scope` is called with `skip_self=True` for
+        one, relying on `self` already being the C parameter's name), so
+        the ordinary `n.id in self.scope` check alone would miss it, and a
+        lambda defined inside a method that reads `self.field` would reach
+        its own trampoline -- a plain function, no such parameter -- with
+        `self` undeclared.
+        """
+        a = node.args
+        bound = set(p.arg for p in
+                    list(a.posonlyargs) + list(a.args) + list(a.kwonlyargs))
+        if a.vararg:
+            bound.add(a.vararg.arg)
+        if a.kwarg:
+            bound.add(a.kwarg.arg)
+        found = set()
+        stack = [node.body]
+        while stack:
+            n = stack.pop()
+            if isinstance(n, ast.Name):
+                if isinstance(n.ctx, ast.Load) and n.id not in bound:
+                    if n.id in self.scope:
+                        found.add(n.id)
+                    elif n.id == "self" and self.cur_class is not None:
+                        found.add(n.id)
+                continue
+            if n is not node and isinstance(
+                    n, (ast.Lambda, ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            stack.extend(ast.iter_child_nodes(n))
+        return sorted(found)
 
     def ex_Starred(self, node):
         v = node.value
