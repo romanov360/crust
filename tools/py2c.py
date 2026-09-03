@@ -2801,6 +2801,41 @@ def _param_used_in_str_compare(fn, name):
     return False
 
 
+_REGEX_MATCH_METHODS = ("match", "search", "finditer", "findall")
+
+
+def _param_used_as_regex_subject(fn, name):
+    """True if `name` is the text argument of a `.match`/`.search`/
+    `.finditer`/`.findall` call (`pat.search(name)`, any receiver -- these
+    method names are regex-specific in this codebase's own style, so a
+    false positive here would need an unrelated class reusing one of them
+    with a *different* meaning) or of the module-level `re.match(pat,
+    name)`/`re.search(pat, name)` form. A strong hint `name` is a string,
+    the same class of override `_param_used_in_str_compare` already is for
+    `==`/`!=` -- added after an int-by-name parameter (`_cond_value`'s
+    `line`, a line of source *text*, not a line *number*) was matched
+    against a compiled pattern with no override in place: the C parameter
+    came out `int`, and the caller's actual string argument was silently
+    truncated at the call boundary rather than ever raising."""
+    for n in ast.walk(fn):
+        if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)):
+            continue
+        if n.func.attr in _REGEX_MATCH_METHODS and n.args and \
+                isinstance(n.args[0], ast.Name) and n.args[0].id == name:
+            return True
+        if n.func.attr == "sub" and len(n.args) >= 2 and \
+                isinstance(n.args[1], ast.Name) and n.args[1].id == name:
+            return True
+    for n in ast.walk(fn):
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) \
+                and isinstance(n.func.value, ast.Name) \
+                and n.func.value.id == "re" \
+                and n.func.attr in ("match", "search") and len(n.args) >= 2 \
+                and isinstance(n.args[1], ast.Name) and n.args[1].id == name:
+            return True
+    return False
+
+
 def arg_ctype(fn, arg):
     if arg.annotation is not None:
         return ann_to_ctype(arg.annotation) or OBJ
@@ -2811,6 +2846,8 @@ def arg_ctype(fn, arg):
     if _param_assigned_from_call(fn, arg.arg, {"input", "raw_input"}):
         return OBJ
     if _param_used_in_str_compare(fn, arg.arg):
+        return OBJ
+    if _param_used_as_regex_subject(fn, arg.arg):
         return OBJ
     guess = infer_from_name(arg.arg)
     if guess in ("bool", "int") and _param_used_as_container(fn, arg.arg):

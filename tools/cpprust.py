@@ -2157,23 +2157,34 @@ _DEFINE = re.compile(r"^[ \t]*#[ \t]*define[ \t]+(\w+)")
 _UNDEF = re.compile(r"^[ \t]*#[ \t]*undef[ \t]+(\w+)")
 
 
-def _cond_value(line, defines):
-    """`True`/`False` for a conditional this pass can decide, else None."""
-    m = _IFDEF.match(line)
+def _cond_value(line_text, defines):
+    """`True`/`False` for a conditional this pass can decide, else None.
+
+    Named `line_text`, not `line`: py2c's untyped-parameter fallback infers
+    a C type from the *name* when nothing else pins it down, and `line` is
+    one of its int-by-convention names (a line *number*), which this
+    parameter -- one line of source *text* -- is not. That mistyped it as
+    `int` and every caller's string argument got silently truncated to a
+    32-bit int at the call boundary; a dereference of the resulting garbage
+    pointer inside `.match()` never surfaced until a real header actually
+    reached this function, since header splicing (`_expand_headers`) had
+    its own bug keeping every `#include` from resolving before that.
+    """
+    m = _IFDEF.match(line_text)
     if m:
         got = m.group(2) in defines
         return got if m.group(1) == "ifdef" else not got
-    m = _IF_DEFINED.match(line)
+    m = _IF_DEFINED.match(line_text)
     if m:
         got = m.group(2) in defines
         return not got if m.group(1) else got
-    m = _IF_LITERAL.match(line)
+    m = _IF_LITERAL.match(line_text)
     if m:
         return m.group(1) == "1"
     # `defined(A) || defined(B) || ..`, or the same with `&&`. Mixing the
     # two would need precedence, so a line with both is left undecided
     # rather than answered by evaluation order.
-    m = re.match(r"^[ \t]*#[ \t]*if[ \t]+(.*?)[ \t]*$", line)
+    m = re.match(r"^[ \t]*#[ \t]*if[ \t]+(.*?)[ \t]*$", line_text)
     if m and "defined" in m.group(1):
         expr = m.group(1)
         if "||" in expr and "&&" in expr:
