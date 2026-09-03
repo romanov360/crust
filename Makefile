@@ -590,6 +590,7 @@ testminipy:
 	if sh tools/rpy_lib/run_crust_re_py2c_test.sh test_re_scope_py2c.py >/tmp/re_scope_py2c.txt 2>&1; then echo "  ok    per-scope regex pattern tracking (cpython == py2c native)"; else echo "  FAIL  per-scope regex pattern tracking (see /tmp/re_scope_py2c.txt)"; fail=1; fi; \
 	if sh tools/rpy_lib/run_crust_re_py2c_test.sh test_generator_py2c.py >/tmp/generator_py2c.txt 2>&1; then echo "  ok    yield as eager list collection (cpython == py2c native)"; else echo "  FAIL  yield/generator lowering (see /tmp/generator_py2c.txt)"; fail=1; fi; \
 	if sh tools/rpy_lib/run_crust_re_py2c_test.sh test_open_missing_py2c.py >/tmp/open_missing_py2c.txt 2>&1; then echo "  ok    open() raises on a missing file (cpython == py2c native)"; else echo "  FAIL  open() missing-file exception (see /tmp/open_missing_py2c.txt)"; fail=1; fi; \
+	if sh tools/rpy_lib/run_crust_re_py2c_test.sh test_re_multiline_py2c.py >/tmp/re_multiline_py2c.txt 2>&1; then echo "  ok    re.M-free line anchors via lookaround (cpython == py2c native)"; else echo "  FAIL  re.M-free line anchors (see /tmp/re_multiline_py2c.txt)"; fail=1; fi; \
 	if [ $$fail = 0 ]; then echo "testminipy: PASS"; \
 	else echo "testminipy: FAIL"; fi; exit $$fail
 

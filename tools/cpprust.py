@@ -2108,16 +2108,28 @@ _OUTLINE = re.compile(
     r"\s*\(")
 
 
-_QUOTED_INCLUDE = re.compile(r'^[ \t]*#[ \t]*include[ \t]*"([^"]+)"[ \t]*$',
-                             re.MULTILINE)
+#: `(?<![^\n])` / `(?![^\n])` are `^` / `$` at a line boundary, written out
+#: rather than passed as `re.MULTILINE` -- py2c's regex lowering only ever
+#: sees a pattern's source text, never the flags argument next to it, so a
+#: flag-dependent anchor silently compiled as an *absolute* string anchor
+#: in the transpiled binary: unlike CPython, it matched only literal offset
+#: 0 (`crust_re_compile` has no multiline mode to opt into either). Against
+#: a real source file -- `#include` never sitting at offset 0, a copyright
+#: header always ahead of it -- that meant this pattern never matched at
+#: all, so `_expand_headers` never spliced a single header in the native
+#: binary. Both anchors are fixed-width negative lookaround, which the
+#: engine does support, so this is the actual fix, not a workaround for a
+#: missing feature: it is what every other `re.M` pattern in this file
+#: already does (see `_clean_macros`), and it is correct under CPython too.
+_QUOTED_INCLUDE = re.compile(
+    r'(?<![^\n])[ \t]*#[ \t]*include[ \t]*"([^"]+)"[ \t]*(?![^\n])')
 
 #: Both spellings. Which one was written decides where it is looked for,
 #: not whether it is spliced at all: an angle include of a header sitting
 #: under an `--incdir` is this project's own, and litehtml includes its
 #: headers both ways.
 _ANY_INCLUDE = re.compile(
-    r'^[ \t]*#[ \t]*include[ \t]*(?:"([^"]+)"|<([^>]+)>)[ \t]*$',
-    re.MULTILINE)
+    r'(?<![^\n])[ \t]*#[ \t]*include[ \t]*(?:"([^"]+)"|<([^>]+)>)[ \t]*(?![^\n])')
 
 
 #: A conditional this pass is willing to decide. Deliberately small: a
@@ -11671,12 +11683,15 @@ T *adjacent_difference(T *first, T *last, T *dst) {
 """
 
 
+#: `(?<![^\n])` is `^` at a line start written out, not `re.M` -- see the
+#: comment on `_ANY_INCLUDE`: py2c drops a `re.compile` flags argument on
+#: the floor, so this anchor matched nothing past offset 0 in the native
+#: binary until it was spelled as a lookbehind the engine actually runs.
 _STD_INCLUDE = re.compile(
-    r"^[ \t]*#\s*include\s*<(vector|string|memory|map|set|algorithm"
+    r"(?<![^\n])[ \t]*#\s*include\s*<(vector|string|memory|map|set|algorithm"
     r"|queue|stack|array|optional|unordered_map|unordered_set"
     r"|numeric"
-    r"|utility)>[ \t]*\n?",
-    re.M)
+    r"|utility)>[ \t]*\n?")
 
 
 _STD_CLASSES = frozenset(("string", "vector", "ownvector",
