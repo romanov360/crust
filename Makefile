@@ -593,6 +593,7 @@ testminipy:
 	if sh tools/rpy_lib/run_crust_re_py2c_test.sh test_re_multiline_py2c.py >/tmp/re_multiline_py2c.txt 2>&1; then echo "  ok    re.M-free line anchors via lookaround (cpython == py2c native)"; else echo "  FAIL  re.M-free line anchors (see /tmp/re_multiline_py2c.txt)"; fail=1; fi; \
 	if sh tools/rpy_lib/run_crust_re_py2c_test.sh test_name_heuristic_str_py2c.py >/tmp/name_heuristic_py2c.txt 2>&1; then echo "  ok    regex-subject param overrides int-by-name guess (cpython == py2c native)"; else echo "  FAIL  regex-subject param typing (see /tmp/name_heuristic_py2c.txt)"; fail=1; fi; \
 	if sh tools/rpy_lib/run_crust_re_py2c_test.sh test_list_index_on_str_py2c.py >/tmp/list_index_str_py2c.txt 2>&1; then echo "  ok    list_index() falls back to string search for a T_STR receiver (cpython == py2c native)"; else echo "  FAIL  list_index() on a string (see /tmp/list_index_str_py2c.txt)"; fail=1; fi; \
+	if sh tools/rpy_lib/run_crust_re_py2c_test.sh test_re_class_shorthand_py2c.py >/tmp/re_class_shorthand_py2c.txt 2>&1; then echo "  ok    \\w/\\d/\\s inside a [...] class (cpython == py2c native)"; else echo "  FAIL  shorthand class inside [...] (see /tmp/re_class_shorthand_py2c.txt)"; fail=1; fi; \
 	if [ $$fail = 0 ]; then echo "testminipy: PASS"; \
 	else echo "testminipy: FAIL"; fi; exit $$fail
 

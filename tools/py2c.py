@@ -5236,6 +5236,25 @@ def regex_parse(pattern):
             while j < n and pattern[j] != "]":
                 ch = pattern[j]
                 if ch == "\\" and j + 1 < n:
+                    # `\d`/`\D`/`\w`/`\W`/`\s`/`\S` *inside* a class member
+                    # `[...]`, not the escape of a literal like `\-`/`\]`/`\\`.
+                    # `_re_class_test`'s "class" case has no representation
+                    # for a nested shorthand -- every item is either a literal
+                    # char or an a-b range -- so parsing one and silently
+                    # keeping only the bare letter ("w" out of "\w") produced
+                    # a specialized matcher that tested for the literal
+                    # character 'w' instead of any word character. Rejecting
+                    # here (rather than mis-specializing) sends the pattern to
+                    # the crust_re VM instead, which supports this correctly
+                    # (see crust_re.h). Found via `[\w:.>()\[\]\s-]`, used to
+                    # recognize a callee expression in `_is_call_result`: with
+                    # `\w`/`\s` read as literal 'w'/'s', it rejected almost
+                    # every real callee, including `this->substr`, so
+                    # `string_substr_from` (part of the transpiler's own
+                    # generated `string` class) looked like it was returning
+                    # something other than a call result and got refused.
+                    if pattern[j + 1] in "dDwWsS":
+                        return None
                     ch = pattern[j + 1]
                     j += 1
                 if j + 2 < n and pattern[j + 1] == "-" and pattern[j + 2] != "]":
