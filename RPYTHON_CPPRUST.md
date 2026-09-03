@@ -29,7 +29,7 @@ python3 tools/rpy_census.py tools/cpprust.py --errors   # just the count
 | translates a 3-line class correctly | no | **yes** |
 | exit code matches CPython's | — | **yes** |
 | output matches CPython on a class with fields | no | **yes** |
-| real litehtml files: agree byte-for-byte / disagree | — | **14 / 0** (12 more fail natively, 17 CPython itself refuses — see below) |
+| real litehtml files: agree byte-for-byte / disagree | — | **23 / 3** (0 fail natively where CPython succeeds, 17 CPython itself refuses — see below) |
 | calls substituted with `None` | 11 | 2 |
 | container advisories | 77 | 77 |
 
@@ -360,17 +360,164 @@ recognized-and-warned-about list:
   the expression is dropped rather than refused, so those two functions
   silently produce nothing.
 
+## From 12 native-only failures to zero
+
+Every one of the gaps above got fixed, plus three more the fixes
+themselves exposed. None were where the diagnosis above expected them —
+each new fix widened what the native binary actually *ran*, and that
+kept surfacing the next bug rather than reaching a clean state. The tools
+used throughout were the same three every time: a `gdb -batch -ex run
+-ex bt` backtrace to find the crash site, a two-line isolated repro
+(`python3 tools/py2c.py repro.py` vs `python3 repro.py`) to confirm the
+divergence outside the 800KB generated file, and — once the isolated
+repro also failed under plain CPython — reading the suspect function
+directly rather than trusting an assumption about what it does.
+
+1. **`yield` → eager list collection.** Exactly as scoped above:
+   `_anchored_finditer` is this codebase's one generator, every caller
+   runs it to exhaustion with `for m in ...:`, so `emit_hoisted_body`
+   collects each `yield`ed value into a list (`cur_gen_var`) and returns
+   that list wherever the function would otherwise return or fall off
+   the end. Not real coroutine semantics — deliberately not needed here.
+
+2. **Regex-pattern tracking scoped to the function it's assigned in.**
+   The root cause behind the seven-file crash, precisely as scoped above
+   (`pat` inside `_anchored_finditer` colliding with unrelated same-named
+   locals elsewhere): `_walk_with_scope` records the `id()` of the
+   enclosing `FunctionDef` for every `NAME = re.compile(...)`, and
+   `_regex_name_in_scope` gates every read against it. A closure
+   capturing an enclosing local that really is the same pattern needed
+   its own carve-out (`lift_nested_functions`/`convert_block_closures`
+   now thread `id(enclosing_fn)` through their closure specs), and the
+   pattern-*text* table (`_regex_var_pat`) needed the same per-scope keying
+   as the name table — two unrelated functions each naming a local `pat`
+   for their own constant compile resolved to whichever one a flat
+   `name -> text` dict saw last, even after the name itself was correctly
+   scoped.
+
+3. **`_re_search`/`_re_pN`/`_cre_run` gained a `pos` parameter**, mirroring
+   `crust_re_exec_from`'s existing `t` (whole subject) / `pos` (search
+   start) split — precisely the fix scoped above, plus a runtime
+   `T_INT`/`T_STR` tag dispatch (`_re_match_any`, `_re_finditer_any`) for
+   the case a compiled pattern reaches a call through a value of unknown
+   origin (a parameter, not a name py2c can trace to its own
+   `re.compile`).
+
+4. **`open(...)`/`with open(...) as f:` now raise on a missing file.** A
+   bare `fopen()` returning NULL was never checked, so `except IOError:`
+   around a "try each candidate directory" loop — exactly the shape
+   `_expand_headers` uses to find a header under `--basedir`/`--incdir` —
+   never fired: the first candidate directory was taken whether or not
+   the file in it actually existed. This is *why* the two fixes above
+   were not the end of it: with `_anchored_finditer` no longer crashing,
+   full corpus runs kept turning up files where the native binary's
+   output was missing entire header-declared classes, because no header
+   had ever actually been spliced into any translation unit, in *any*
+   file, the whole time. `codepoint.cpp` and `url.cpp` moved from "no
+   crash" to "byte-identical with CPython" only after this landed — the
+   earlier "no crash" reading was a false negative, not progress.
+
+5. **`re.compile(pattern, re.MULTILINE)`'s flags argument is silently
+   dropped.** py2c's regex pre-pass interns only a `re.compile()` call's
+   pattern *text*; nothing anywhere reads a second, flags argument, and
+   `crust_re_compile` has no multiline mode to opt into either. So `^`/`$`
+   in a `re.M`-flagged pattern compiled as a plain *string* anchor —
+   `^` matched only literal offset 0, never a line start past it — which
+   is exactly what `_ANY_INCLUDE` (the pattern `_expand_headers` uses to
+   find `#include` lines) is built from, and no real source file has one
+   at offset 0. Rewritten as `(?<![^\n])`/`(?![^\n])` (fixed-width
+   lookaround the engine already supports, and the same idiom
+   `_clean_macros` already used in place of `re.M`), dropping the
+   now-unnecessary flags argument. A native-only bug expressed as a
+   pattern rewrite, not new engine support.
+
+6. **The int-by-name heuristic can still override an obviously-string
+   parameter.** `infer_from_name`'s fallback guessed `int` for
+   `_cond_value`'s `line` parameter (a source line of *text*, matched
+   against `re` patterns; "line" is in the heuristic's int-by-convention
+   list, meaning line *number*). Every caller's string argument was then
+   silently truncated to that `int` slot at the call boundary, and the
+   function handed the resulting garbage straight back out as a
+   `.match()` subject — segfaulting inside the regex engine the moment a
+   real header (finally reaching `_eval_conditionals`, thanks to fix 4)
+   made this function actually run. `tools/cpprust.py`'s own instance was
+   fixed by renaming the parameter; the general py2c gap was fixed by
+   adding `_param_used_as_regex_subject` to `arg_ctype`'s existing list of
+   usage-based overrides (alongside `_param_used_in_isinstance`,
+   `_param_used_in_str_compare`, ...), so a parameter that is the text
+   argument of `.match`/`.search`/`.finditer`/`.findall`/`.sub` is never
+   left to a name guess that could be wrong the same way again.
+
+7. **`list_index()` had no fallback for a string it couldn't statically
+   type.** `.index()` on a receiver py2c cannot prove is `char*` (a local
+   assigned from a slice, most often — `value_ctype` reports the generic
+   `obj` for *every* `x[a:b]`, string or list alike) dispatches to
+   `list_index`, which used to `abort()` the instant its receiver's tag
+   was not `T_LIST`. `_monomorphise_function_templates`'s
+   `probe_body0 = text[t["start"]:t["end"]]` is always a string at
+   runtime (a slice of a known `char*`) but declared `obj` in the
+   generated C, and `probe_body0.index("<")` crashed the native binary
+   the first time a real template definition reached it. Fixed at
+   `list_index` itself: a `T_STR` receiver (paired with a `T_STR` needle)
+   now delegates to `str_find`, the same search `str.index` already uses.
+   A genuine list miss is unaffected and still aborts.
+
+8. **`\w`/`\d`/`\s` inside a `[...]` character class meant the literal
+   letter.** `regex_parse` (the translation-time specializer for simple
+   constant patterns) parsed a class member's backslash escape the same
+   way it parses one outside a class — drop the backslash, keep the next
+   character — which is wrong specifically inside `[...]`: `\w` there
+   means "any word character", not the literal letter "w", and
+   `_re_class_test`'s "class" case has no representation for a nested
+   shorthand at all. Found via `tools/cpprust.py`'s own
+   `_is_call_result`, which recognizes a callee expression with
+   `[\w:.>()\[\]\s-]`: read as the literal set `{w,:,.,>,(,),[,],s,-}`,
+   it rejected almost any real callee, including calls inside the
+   transpiler's own generated `string` class (`this->substr(...)`) —
+   confirmed with a two-line repro (`re.match(r"^[\w:.>()\[\]\s-]+$",
+   "this->substr")`, `False` natively, `True` under CPython) after a
+   `git worktree` bisection against the pre-session commit ruled out
+   every fix above as the cause. Fixed by rejecting rather than
+   mis-specializing: `regex_parse` returns `None` the moment it sees a
+   shorthand inside a class, sending the pattern to the crust_re VM tier
+   instead, which implements this correctly.
+
+A fresh corpus run after all eight:
+
+| | files |
+|---|---|
+| both sides translate, byte-identical output | **23** |
+| CPython itself refuses (subset gap, not a native bug) | 17 |
+| native fails where CPython succeeds | **0** |
+| both succeed but disagree | 3 |
+
+Native crashes and CppError-refuses-what-CPython-accepts are both gone —
+every remaining native-only outcome is a byte-identical translation or an
+agreed refusal. The three `DIFF` files (`codepoint.cpp`, `num_cvt.cpp`,
+`url.cpp`) are a new, better-shaped problem: both sides now succeed, and
+disagree on the *output*. `codepoint.cpp`'s diff is namespace flattening
+producing `litehtml_litehtml_is_ascii_codepoint` (a reopened `namespace
+litehtml { }` — once in the header for the declaration, again in the .cpp
+for the definition — double-prefixing a function whose C++ name already
+happens to start with `litehtml_`). That specific double-prefix
+reproduces under plain CPython too, in isolation
+(`cpp_auto.resolve_namespaces` on a two-block minimal repro) — so unlike
+every bug above, this is *not* a native-only divergence, and whatever
+makes the real corpus run's CPython side avoid it is still unexplained.
+Not yet investigated for `num_cvt.cpp`/`url.cpp`.
+
 ## What has not been measured yet
 
-Nothing here says the result is *faster*. 14 of 43 real files now agree
-byte-for-byte with CPython, and zero disagree where both succeed — real
-progress on "does it lower correctly," measured against real input this
-time, not a synthetic repro. But the corpus is not fully green: 12 files
-still fail natively where CPython succeeds (two root causes, both
-diagnosed above, neither fixed yet), so timing the binary now would still
-be timing a program that cannot yet process the whole corpus. The order
-is unchanged in kind, just further along: clear the two remaining
-divergence causes, get to 43/43, then measure.
+Nothing here says the result is *faster*. 23 of 43 real files now agree
+byte-for-byte with CPython, up from 14, and zero fail natively where
+CPython succeeds — real progress on "does it lower correctly," measured
+against real input this time, not a synthetic repro. But the corpus is
+not fully green: 3 files now produce *different* output on the two sides
+(not diagnosed yet), so timing the binary now would still be timing a
+program that cannot yet process the whole corpus identically. The order
+is unchanged in kind, just further along: clear the remaining divergence,
+get to 43/43 (or 26/26 once the 17 agreed refusals are separately
+resolved), then measure.
 
 Two things worth knowing before that measurement is designed:
 
