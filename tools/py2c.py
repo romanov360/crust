@@ -13552,8 +13552,23 @@ class Transpiler:
             if func.attr == "pop" and not node.args and \
                     not self._local_method_accepts_argc("pop", 0):
                 return "list_pop(%s)" % self.wrap_obj(func.value)
+            # `s.index(x)` and `xs.index(x)` both parse the same way --
+            # one attribute call, one argument -- and only the receiver's
+            # type says which the author meant. A receiver known to be a
+            # string defers to the STR_METHODS dispatch below (`str_find`);
+            # `list_index` is not just the wrong function, it is a
+            # different runtime contract entirely -- CPython's `.index`
+            # raises when the value is absent, and `list_index` matches
+            # that by aborting the whole process, while `str.index`
+            # already relaxes it to "yields -1" (see the comment on the
+            # `find`/`index` branch below) because callers rely on being
+            # able to fail a probe rather than crash on one. Handing a
+            # boxed string to `list_index` compiles fine -- both are
+            # `obj` -- and aborts at the first substring it doesn't
+            # happen to contain.
             if func.attr == "index" and len(node.args) == 1 and \
-                    func.attr not in self.method_owners:
+                    func.attr not in self.method_owners and \
+                    self.value_ctype(func.value) != "char*":
                 return "list_index(%s, %s)" % (self.wrap_obj(func.value),
                                                self.wrap_obj(node.args[0]))
             # `s.count(sub, start[, end])` -- a string count over a window.
@@ -15354,7 +15369,8 @@ class Transpiler:
     # obj already). The receiver's static type does not tell them apart --
     # both are plain `obj` parameters in the generated C -- but the helper
     # py2c chose does, exactly.
-    _SCALAR_HELPERS = ("str_find_from(", "str_find_range(", "str_count(")
+    _SCALAR_HELPERS = ("str_find(", "str_find_from(", "str_find_range(",
+                       "str_count(")
 
     # Runtime primitives that mutate in place and return C `void`, for the
     # in-place list/dict/set methods Python always types as returning
@@ -15848,8 +15864,21 @@ class Transpiler:
         t = self.value_ctype(node)
         if t in _SIGNED_INT_RANK:
             return self.expr(node)           # already a C integer; no roundtrip
+        _rendered = self.expr(node) if isinstance(node, ast.Call) else None
+        if _rendered is not None and self._scalar_helper_ct(_rendered) is not None:
+            # A call that lowers to a scalar helper (`str_find`, `str_count`,
+            # ...) is already a raw long however `value_ctype` reads it --
+            # see `_scalar_helper_ct`'s own note, that the receiver's
+            # static type cannot tell `s.index(x)` from `xs.index(x)`
+            # apart, only the helper py2c actually emitted can -- and
+            # `AS_INT` on an already-long value reads a `.u.i` field that
+            # is not there. `coerce_to`/`wrap_obj` already check this;
+            # this is the same check for the one caller (slice bounds,
+            # `s[:s.index(x)]`) that rendered its own operand instead.
+            return _rendered
         if t == OBJ or self.is_obj_word(node):
-            return "AS_INT(%s)" % self.expr(node)
+            return "AS_INT(%s)" % (
+                _rendered if _rendered is not None else self.expr(node))
         return "pyint(%s)" % self.wrap_obj(node)
 
     def _lower_affix(self, m, func, node):
