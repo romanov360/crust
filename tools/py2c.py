@@ -3232,6 +3232,30 @@ def _is_dunder_main_guard(node):
             and node.test.comparators[0].value == "__main__")
 
 
+def _walk_with_scope(tree):
+    """Like `ast.walk`, but each node also carries the `id()` of its
+    nearest enclosing `def`/`async def` (`None` at module level, and for
+    anything inside a top-level class body that isn't itself inside a
+    method -- a class body is not a function scope).
+
+    Only a `def`/`async def` opens a new scope for this purpose; a nested
+    scope-within-a-scope still reports the *innermost* enclosing function,
+    which is what matters for "is this reference in the same function as
+    that assignment" checks -- a lambda or comprehension inside a function
+    does not get its own regex-tracking scope, since it can't itself bind
+    a module-style `NAME = re.compile(...)` in a way `_is_re_compile`
+    would even recognize as a target of that shape.
+    """
+    stack = [(s, None) for s in tree.body]
+    while stack:
+        n, scope = stack.pop()
+        yield n, scope
+        child_scope = id(n) if isinstance(
+            n, (ast.FunctionDef, ast.AsyncFunctionDef)) else scope
+        for c in ast.iter_child_nodes(n):
+            stack.append((c, child_scope))
+
+
 def lift_nested_functions(tree):
     """Closure-convert one level of nested functions to file scope.
 
@@ -3362,7 +3386,14 @@ def lift_nested_functions(tree):
             my_subs.append(sub)
             # a value use of this fn (passed as an argument, stored, returned)
             # needs a real closure; register a spec so a trampoline is emitted.
-            specs[mangled] = (sub, len(captures), real_defs)
+            # `id(fn)` -- the immediate enclosing scope these captures were
+            # read from -- rides along too, so a name-and-value-tracking pass
+            # (the regex pattern-text scope propagation, currently the only
+            # consumer) can look a capture up in the *one* scope it actually
+            # came from instead of matching by bare name across the whole
+            # file, which is exactly the collision this scoping exists to
+            # avoid in the first place.
+            specs[mangled] = (sub, len(captures), real_defs, id(fn))
             process(sub, mangled, cls)  # handle deeper nesting
         # any remaining bare references to a lifted name are value uses
         repl = _ValueUseReplacer(dict(name_map))
@@ -3396,7 +3427,8 @@ def convert_block_closures(tree):
     captured environment (their value is the default expression at def time),
     while params with constant/no defaults (`pref=None`) stay caller-supplied.
 
-    Returns {mangled: (lifted_node, n_caps, real_default_nodes)}.
+    Returns {mangled: (lifted_node, n_caps, real_default_nodes,
+    id(enclosing_fn))}.
     """
     specs = {}
     lifted = []
@@ -3471,7 +3503,7 @@ def convert_block_closures(tree):
                 sub.decorator_list = []
                 self.generic_visit(sub)        # handle any deeper nesting
                 lifted.append(sub)
-                specs[mangled] = (sub, n_caps, real_defs)
+                specs[mangled] = (sub, n_caps, real_defs, id(fn))
                 marker = ast.Call(
                     func=ast.Name(id="__closure_env__", ctx=ast.Load()),
                     args=[ast.Constant(value=mangled)] + cap_vals,
@@ -5215,18 +5247,32 @@ def _re_emit_build(pid, ng, indent):
 
 
 def regex_emit_c(pid, parsed):
-    """Emit `static obj _re_p<pid>(char* _t, int _anchored)` for `parsed`."""
+    """Emit `static obj _re_p<pid>(char* _t, long _pos, int _anchored)` for
+    `parsed`.
+
+    `_pos` is where the search itself starts, not a slice offset: `_t` is
+    still the whole subject, so an anchored (`.match`) search still tries
+    exactly `_pos` and no further (the existing `if (_anchored) break`
+    already gives that -- the first, only, iteration is now `_s == _pos`
+    instead of always `_s == 0`). `^` is not the same anchor as `.match`'s
+    `pos`, though: unlike `.match`, it always means the true start of the
+    subject, so a nonzero `_pos` has to fail it outright rather than test
+    it at `_pos` -- `re.compile(r"^x").match("ax", 1)` is `None` in
+    CPython even though `text[1]` is `x`.
+    """
     atoms = parsed["atoms"]
     ng = parsed["ngroups"]
     out = []
     a = out.append
-    a("static obj _re_p%d(char* _t, int _anchored) {" % pid)
+    a("static obj _re_p%d(char* _t, long _pos, int _anchored) {" % pid)
     a("    if (!_t) return OBJ_NONE;")
     a("    long _L = (long)strlen(_t);")
+    if parsed["start_anchor"]:
+        a("    if (_pos != 0) return OBJ_NONE;")
     gvars = ["_g0s", "_g0e"] + sum(
         ([("_g%ds" % k), ("_g%de" % k)] for k in range(1, ng + 1)), [])
     a("    long %s;" % ", ".join(gvars))
-    a("    for (long _s = 0; _s <= _L; _s++) {")
+    a("    for (long _s = _pos; _s <= _L; _s++) {")
     a("        long p = _s; _g0s = _s;")
     for k in range(1, ng + 1):
         a("        _g%ds = -1; _g%de = -1;" % (k, k))
@@ -5321,8 +5367,36 @@ class Transpiler:
         self._subproc_used = False  # subprocess.run / tempfile.mkdtemp shim
         self._subproc_vars = set()  # names bound to a subprocess.run result
         self._regex_dyn_vars = set()  # names bound to re.compile(<runtime expr>)
-        self._regex_var_pat = {}    # name -> pattern text, for constant compiles
+        # (scope, name) -> pattern text, for constant compiles. Keyed by scope
+        # as well as name for the same reason `_regex_var_scopes` is: two
+        # unrelated functions each naming a local `pat` for their own
+        # *constant* `re.compile(...)` need their own pattern text, not
+        # whichever one this dict saw last -- a bare-name key let scan_words's
+        # `pat.finditer(...)` recover scan_digits's pattern once both had run
+        # through this same pre-pass, even after `_regex_name_in_scope` (which
+        # only answers "is `pat` valid here", not "which pattern is it")
+        # correctly confirmed the name itself was in scope.
+        self._regex_var_pat = {}
+        # Flat set of every name that is a constant-compile var in *some*
+        # scope, for a cheap "is this name worth checking at all" test before
+        # the real, scoped lookup (`_regex_pat_for`) picks the right entry.
+        self._regex_var_pat_names = set()
         self._regex_vars = set()    # names bound to re.compile(const) (a matcher id)
+        # A name like `pat` means something different in every function that
+        # reassigns it -- `_regex_vars`/`_regex_dyn_vars`/`_regex_var_pat` are
+        # bare-name sets with no notion of *which* `pat`, so a receiver in a
+        # function that never touches regex at all still matched by name
+        # alone once some *other*, unrelated function bound the same name to
+        # a compiled pattern: `_anchored_finditer`'s own `pat` parameter
+        # matched `_check_ref_returns`'s local `pat = re.compile(dynamic)`
+        # this way, and `AS_STR()` on the parameter's real value -- an int
+        # id from the *translation-time* compiler, boxed as `OBJ_INT` -- read
+        # the tag union's other arm as a pointer. `_regex_var_scopes` records
+        # which function (`id(FunctionDef)`, or `None` for module level) each
+        # tracked name's assignment actually lives in, so a reference is
+        # only trusted where that assignment is visible.
+        self._regex_var_scopes = {}   # name -> {scope_id, ...}
+        self.cur_func_id = None     # id() of the FunctionDef being emitted
         self._regex_match_vars = set()  # names bound to a .search()/.match() result
         self._regex_list_vars = set()   # names bound to a list of re.compile(const)
         self._ossys_used = False    # os.path/sys shim referenced
@@ -5348,6 +5422,7 @@ class Transpiler:
         self.narrowed = {}          # name -> ctype, active in an isinstance block
         self.hoisted = set()        # locals declared at function top
         self.cur_ret = OBJ          # current function's return ctype
+        self.cur_gen_var = None     # current function's collected-yields list, if a generator
         self.loop_n = 0             # unique-id counter for generated loops
         self.exc_n = 0              # unique-id counter for try/except frames
         self.cm_n = 0               # unique-id counter for inlined contextmanagers
@@ -5694,9 +5769,11 @@ class Transpiler:
             return isinstance(v, ast.Call) and isinstance(v.func, ast.Attribute) \
                 and isinstance(v.func.value, ast.Name) \
                 and v.func.value.id == "re" and v.func.attr == "compile"
-        for _n in ast.walk(tree):
+        for _n, _scope in _walk_with_scope(tree):
             if isinstance(_n, ast.Assign) and len(_n.targets) == 1 and \
                     isinstance(_n.targets[0], ast.Name) and _is_re_compile(_n.value):
+                _nm = _n.targets[0].id
+                self._regex_var_scopes.setdefault(_nm, set()).add(_scope)
                 # A constant pattern interns to an integer matcher id; a
                 # runtime one compiles to nothing at all -- the "compiled
                 # object" is just the pattern string, and _cre_dyn_get's cache
@@ -5704,15 +5781,16 @@ class Transpiler:
                 _a = _n.value.args
                 if _a and isinstance(_a[0], ast.Constant) \
                         and isinstance(_a[0].value, str):
-                    self._regex_vars.add(_n.targets[0].id)
+                    self._regex_vars.add(_nm)
                     # Remember the text as well as the id. Plain .search()/
                     # .match() keep the specialized matcher, but findall/sub/
                     # finditer and the 3-arg search have no specialized form
                     # and need the pattern to reach the bridge.
-                    self._regex_var_pat[_n.targets[0].id] = _a[0].value
+                    self._regex_var_pat[(_scope, _nm)] = _a[0].value
+                    self._regex_var_pat_names.add(_nm)
                 else:
                     self._regex_dyn = True
-                    self._regex_dyn_vars.add(_n.targets[0].id)
+                    self._regex_dyn_vars.add(_nm)
         for _n in ast.walk(tree):
             if isinstance(_n, ast.Assign) and len(_n.targets) == 1 and \
                     isinstance(_n.targets[0], ast.Name) and \
@@ -5754,6 +5832,34 @@ class Transpiler:
             if isinstance(_it, ast.Name) and _it.id in self._regex_list_vars \
                     and isinstance(_tgt, ast.Name):
                 self._regex_vars.add(_tgt.id)
+        # A closure-converted nested function (`lift_nested_functions` or
+        # `convert_block_closures`, both already run above) receives a
+        # captured enclosing local -- a compiled pattern among them,
+        # potentially -- as a same-named parameter of its own, lifted to
+        # file scope with its own, different FunctionDef id. Scope-wise that
+        # parameter genuinely is the same pattern the capture read, so its
+        # valid scope (and, for a *constant* pattern, its actual text) is
+        # propagated forward into the lifted function's own scope.
+        #
+        # The propagation has to come from the *one* scope this specific
+        # capture was actually read from -- `_encl_id`, threaded through
+        # both lift passes above for exactly this -- not from every scope
+        # that happens to define a same-named local. Two functions with
+        # their own unrelated `pat = re.compile(...)`, plus a third whose
+        # nested closure also captures a `pat`, is exactly what
+        # `test_re_scope_py2c.py` covers: matching by bare name alone (an
+        # earlier version of this loop did) let whichever of the two
+        # unrelated patterns happened to be scanned last win, silently,
+        # for a capture that was neither.
+        for _spec in self.closure_specs.values():
+            _fn, _n_caps, _real_defs, _encl_id = _spec
+            for _cap in _fn.args.args[:_n_caps]:
+                if _cap.arg in self._regex_var_scopes:
+                    self._regex_var_scopes[_cap.arg].add(id(_fn))
+                _txt = self._regex_var_pat.get((_encl_id, _cap.arg))
+                if _txt is not None:
+                    self._regex_var_pat[(id(_fn), _cap.arg)] = _txt
+                    self._regex_var_pat_names.add(_cap.arg)
         self._scan_ctypes(tree)
         # cross-module class registry: clsname -> (ClassInfo, modname)
         self.xclasses = {}
@@ -5995,12 +6101,12 @@ class Transpiler:
                 pre.extend(self._regex_vm_prelude())
             for pid in sorted(self._regex_parsed):
                 pre.extend(regex_emit_c(pid, self._regex_parsed[pid]).splitlines())
-            disp = ["static obj _re_search(long id, char* t, int anc) {"]
+            disp = ["static obj _re_search(long id, char* t, long pos, int anc) {"]
             for pid in sorted(self._regex_parsed):
-                disp.append("    if (id == %d) return _re_p%d(t, anc);"
+                disp.append("    if (id == %d) return _re_p%d(t, pos, anc);"
                             % (pid, pid))
             for pid in sorted(self._regex_vm):
-                disp.append("    if (id == %d) return _cre_run(%d, t, anc);"
+                disp.append("    if (id == %d) return _cre_run(%d, t, pos, anc);"
                             % (pid, self._regex_vm_slot[pid]))
             disp.append("    return OBJ_NONE;")
             disp.append("}")
@@ -8391,7 +8497,9 @@ class Transpiler:
         self.emit("void %s___init__(%s) {" % (ci.csym, init_sig))
         self.indent += 1
         self.cur_ret = "void"
+        self.cur_func_id = id(fn)
         self.emit_hoisted_body(fn.body)
+        self.cur_func_id = None
         self.indent -= 1
         self.emit("}")
         self.emit()
@@ -8490,6 +8598,7 @@ class Transpiler:
         self.enter_scope(fn, skip_self=not static)
         ret = self._c_ret(fn)
         self.cur_ret = ret
+        self.cur_func_id = id(fn)
         params = self.param_list(fn, skip_self=not static)
         if static:                          # @staticmethod: no receiver at all
             plist = ", ".join(params) if params else "void"
@@ -8539,6 +8648,7 @@ class Transpiler:
             else:
                 self._emit_vararg_setup(fn)
         self.emit_hoisted_body(fn.body)
+        self.cur_func_id = None
         self.indent -= 1
         self.emit("}")
         self.emit()
@@ -8549,11 +8659,13 @@ class Transpiler:
         an object). __str__ is otherwise an unlowered dunder."""
         self.enter_scope(fn, skip_self=True)
         self.cur_ret = OBJ
+        self.cur_func_id = id(fn)
         self.emit("obj %s___str__(Obj* self_) {" % ci.csym)
         self.indent += 1
         self.emit("%s* self = (%s*)self_;" % (ci.csym, ci.csym))
         self.emit("(void)self;")
         self.emit_hoisted_body(fn.body)
+        self.cur_func_id = None
         self.indent -= 1
         self.emit("}")
         self.emit()
@@ -8566,11 +8678,13 @@ class Transpiler:
         other = fn.args.args[1].arg if len(fn.args.args) > 1 else "other"
         self.enter_scope(fn, skip_self=True)
         self.cur_ret = "bool"
+        self.cur_func_id = id(fn)
         self.emit("bool %s___eq__(Obj* self_, obj %s) {" % (ci.csym, cname(other)))
         self.indent += 1
         self.emit("%s* self = (%s*)self_;" % (ci.csym, ci.csym))
         self.emit("(void)self;")
         self.emit_hoisted_body(fn.body)
+        self.cur_func_id = None
         self.indent -= 1
         self.emit("}")
         self.emit()
@@ -8584,12 +8698,14 @@ class Transpiler:
         other = fn.args.args[1].arg if len(fn.args.args) > 1 else "other"
         self.enter_scope(fn, skip_self=True)
         self.cur_ret = "obj"
+        self.cur_func_id = id(fn)
         self.emit("obj %s___add__(Obj* self_, obj %s) {"
                   % (ci.csym, cname(other)))
         self.indent += 1
         self.emit("%s* self = (%s*)self_;" % (ci.csym, ci.csym))
         self.emit("(void)self;")
         self.emit_hoisted_body(fn.body)
+        self.cur_func_id = None
         self.indent -= 1
         self.emit("}")
         self.emit()
@@ -9006,7 +9122,12 @@ class Transpiler:
         # forever (e.g. `while _coalesce_once(g): ...` on an empty graph).
         ret = getattr(self, "cur_ret", OBJ)
         if ret and ret != "void" and not _stmts_always_exit(body):
-            if ret in (OBJ, "obj"):
+            if self.cur_gen_var is not None:
+                # Falling off the end -- exhaustion, not an omission --
+                # returns what has been collected so far, not `None`;
+                # see `st_Return`.
+                self.emit("return %s;" % self.cur_gen_var)
+            elif ret in (OBJ, "obj"):
                 self.emit("return OBJ_NONE;")
             elif ret.endswith("*"):
                 self.emit("return NULL;")
@@ -9168,7 +9289,7 @@ class Transpiler:
         # closure-converted nested functions: captures come from `env`, the
         # caller-supplied params from `args` (filling defaults when short).
         for mangled in sorted(self.closure_values_needed):
-            node, n_caps, real_defs = self.closure_specs[mangled]
+            node, n_caps, real_defs, _encl_id = self.closure_specs[mangled]
             ret = self._ret_ctype(node.returns)
             parts = []
             for i in range(n_caps):
@@ -9584,6 +9705,65 @@ class Transpiler:
                     return not eq
         return None
 
+    def _regex_name_in_scope(self, name):
+        """Whether `name`'s entry in `_regex_vars`/`_regex_dyn_vars`/
+        `_regex_var_pat` actually applies *here* -- the function currently
+        being emitted (`self.cur_func_id`) is the same one the tracked
+        `NAME = re.compile(...)` assignment was found in, or that
+        assignment was at module level (`None` in the scope set, valid
+        everywhere). A name with no recorded scope at all predates this
+        check (a `.add()`/entry made some other way); treated as valid
+        everywhere rather than silently disabling a path nothing has ever
+        reported broken.
+        """
+        scopes = self._regex_var_scopes.get(name)
+        if scopes is None:
+            return True
+        return None in scopes or self.cur_func_id in scopes
+
+    def _regex_pat_for(self, name):
+        """The constant pattern text `name` refers to in the current scope,
+        or None. `_regex_name_in_scope` only answers whether `name` is a
+        trusted regex var *here*; `_regex_var_pat` can hold a different
+        pattern string per scope for the same bare name (see its
+        definition), so recovering the actual text has to look the entry up
+        under the current function's id too, not just check the name."""
+        pat = self._regex_var_pat.get((self.cur_func_id, name))
+        if pat is not None:
+            return pat
+        return self._regex_var_pat.get((None, name))
+
+    def _is_generator(self, fn):
+        """True if `fn`'s own body uses `yield`/`yield from` -- not a
+        nested def/lambda's.
+
+        A `@contextmanager`-decorated one is excluded: `_inline_ctxmgr`
+        already has a real, working strategy for that shape (splice the
+        code before/after its one `yield` straight into each `with`
+        site), and this function is never called as an ordinary function
+        there anyway.
+
+        Everything else here gets the general lowering below: collect
+        every yielded value into a list and return that, rather than
+        real coroutine semantics (`.send()`, a value read back from
+        `yield`, resuming a suspended call frame). That is not generators
+        -- it is what a generator degenerates to when every call site
+        consumes it with a plain `for x in g(...):` run to exhaustion,
+        which is the only shape this codebase's one generator function,
+        `_anchored_finditer` in cpp_auto.py, is ever used with.
+        """
+        if self._is_contextmanager(fn):
+            return False
+        stack = list(fn.body)
+        while stack:
+            n = stack.pop()
+            if isinstance(n, (ast.Yield, ast.YieldFrom)):
+                return True
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                continue
+            stack.extend(ast.iter_child_nodes(n))
+        return False
+
     def func_def(self, node):
         self.enter_scope(node, skip_self=False)
         try:
@@ -9596,6 +9776,9 @@ class Transpiler:
             pass        # advisory only: never let analysis break compilation
         ret = self._ret_ctype(node.returns)
         self.cur_ret = ret
+        self.cur_func_id = id(node)
+        is_gen = self._is_generator(node)
+        self.cur_gen_var = "_gen_out" if is_gen else None
         if self._uses_argv(node):
             self.scope["argc"] = "int"
             self.scope["argv"] = "char**"
@@ -9638,6 +9821,15 @@ class Transpiler:
         else:
             self.emit("%s {" % sig)
         self.indent += 1
+        if is_gen:
+            # Real generator semantics -- a suspended call frame resumed by
+            # the caller -- have no lowering here. Every consumer of this
+            # one runs it to exhaustion with a plain `for x in g(...):`, so
+            # collecting every yielded value into a list up front and
+            # returning that is observably the same thing for them; `yield`
+            # (in `st_Expr`/`ex_Yield`) appends to it, and every `return`
+            # (in `st_Return`) hands it back instead of running normally.
+            self.emit("obj %s = list_new();" % self.cur_gen_var)
         self._emit_vararg_setup(node)
         # Python runs module-level code at import time. A single translation
         # unit has no _entry.c to do that, so main runs its own module init
@@ -9657,6 +9849,8 @@ class Transpiler:
         self.emit_hoisted_body(body)
         self.indent -= 1
         self.emit("}")
+        self.cur_gen_var = None
+        self.cur_func_id = None
 
     # ---- untyped-container inference + rpython-rule warnings -------------
 
@@ -10087,6 +10281,9 @@ class Transpiler:
         if isinstance(v, ast.Constant) and isinstance(v.value, str):
             first = v.value.strip().splitlines()
             return ["/* " + first[0] + " */"] if first else []
+        if isinstance(v, ast.Yield) and self.cur_gen_var is not None:
+            val = "OBJ_NONE" if v.value is None else self.wrap_obj(v.value)
+            return ["list_append(%s, %s);" % (self.cur_gen_var, val)]
         return [self.expr(v) + ";"]
 
     def st_Assign(self, node):
@@ -10531,7 +10728,8 @@ class Transpiler:
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
                 and isinstance(node.func.value, ast.Name) \
                 and (node.func.value.id in self._regex_dyn_vars
-                     or node.func.value.id in self._regex_var_pat):
+                     or node.func.value.id in self._regex_var_pat_names) \
+                and self._regex_name_in_scope(node.func.value.id):
             if node.func.attr in ("search", "match", "finditer", "findall"):
                 return OBJ
             if node.func.attr == "sub":
@@ -11126,6 +11324,15 @@ class Transpiler:
 
     def st_Return(self, node):
         pre, restore = self._try_finallys(stop_at_loop=False)
+        if self.cur_gen_var is not None:
+            # `return` inside a generator ends it (StopIteration); a value
+            # on it (`return x`) sets StopIteration's own value, which a
+            # plain `for m in g(...):` -- the only way this codebase's one
+            # generator is ever consumed -- never reads, so it is dropped
+            # rather than lowered. What every caller here actually wants
+            # is what has been collected so far.
+            tail = (["g_exc_sp = %s;" % restore] if restore is not None else [])
+            return pre + tail + ["return %s;" % self.cur_gen_var]
         ret = getattr(self, "cur_ret", OBJ)
         if node.value is None:
             r = "return OBJ_NONE;" if ret in (OBJ, "obj") else "return;"
@@ -12745,7 +12952,20 @@ class Transpiler:
                 self._io_used.add("fopen")
                 mode = self.as_str(node.args[1]) if len(node.args) > 1 \
                     else "\"r\""
-                return "fopen(%s, %s)" % (self.as_str(node.args[0]), mode)
+                # CPython's open() raises on a missing file; a bare fopen()
+                # just returns NULL, which every `except IOError:` around a
+                # header/config lookup (never checked here, since a builtin
+                # exception type matches any raise -- see _exc_match_cond)
+                # was relying on to fire. Without this, a failed open() was
+                # silently treated as success: `with open(p) as f: f.read()`
+                # read from a NULL FILE* (fread is guarded, so it produced
+                # ""), and callers that build a candidate path list (try each
+                # dir in order, first one that opens wins) took the very
+                # first candidate whether or not it existed.
+                return ("({ FILE* _f = fopen(%s, %s); "
+                        "if (!_f) rt_raise(OBJ_STR("
+                        "\"[Errno 2] No such file or directory\")); "
+                        "_f; })") % (self.as_str(node.args[0]), mode)
             if f.id == "input":
                 self._io_used.update(("malloc", "fgets", "stdin"))
                 return ("({ char* _b = malloc(4096); "
@@ -13430,13 +13650,14 @@ class Transpiler:
             # module (minire/test_minire) whose Pattern/Match classes share those
             # method names -- those modules aren't part of the bootstrap link.
             if (self._regex_ids or self._regex_dyn) and isinstance(func.value, ast.Name) and (
-                    func.value.id in self._regex_vars or
+                    (func.value.id in self._regex_vars and
+                     self._regex_name_in_scope(func.value.id)) or
                     func.value.id in self._regex_match_vars):
                 if func.attr in ("search", "match") and len(node.args) == 1:
                     anc = "1" if func.attr == "match" else "0"
                     txt = self.coerce_to("char*", node.args[0],
                                          self.expr(node.args[0]))
-                    return "_re_search(AS_INT(%s), %s, %s)" % (
+                    return "_re_search(AS_INT(%s), %s, 0, %s)" % (
                         self.wrap_obj(func.value), txt, anc)
                 if func.attr == "group":
                     if not node.args:
@@ -13699,7 +13920,7 @@ class Transpiler:
                             anc = "1" if func.attr == "match" else "0"
                             txt = self.coerce_to("char*", node.args[1],
                                                  self.expr(node.args[1]))
-                            return "_re_search(%d, %s, %s)" % (pid, txt, anc)
+                            return "_re_search(%d, %s, 0, %s)" % (pid, txt, anc)
                     # A pattern only known at runtime -- an interpreter passing
                     # a guest script's pattern through, say. Compiled on first
                     # use and cached, so a loop over the same pattern pays once.
@@ -14064,8 +14285,9 @@ class Transpiler:
             # module's Pattern/Match methods); any other receiver keeps the
             # conservative guard so a real ShivyCX `.search`/`.group` isn't shadowed.
             _re_recv = isinstance(func.value, ast.Name) and (
-                func.value.id in self._regex_vars or
-                func.value.id in self._regex_dyn_vars or
+                (func.value.id in self._regex_vars or
+                 func.value.id in self._regex_dyn_vars) and
+                self._regex_name_in_scope(func.value.id) or
                 func.value.id in self._regex_match_vars)
             # A dynamically compiled pattern IS its pattern string, so its
             # methods go straight to the dynamic bridge rather than through
@@ -14074,8 +14296,10 @@ class Transpiler:
             # search/match, but everything else routes through the bridge with
             # the pattern text recovered from the pre-pass.
             if isinstance(func.value, ast.Name) \
-                    and func.value.id in self._regex_var_pat:
-                _pt = c_string(self._regex_var_pat[func.value.id])
+                    and func.value.id in self._regex_var_pat_names \
+                    and self._regex_name_in_scope(func.value.id) \
+                    and self._regex_pat_for(func.value.id) is not None:
+                _pt = c_string(self._regex_pat_for(func.value.id))
                 _a0 = (self.coerce_to("char*", node.args[0],
                                       self.expr(node.args[0]))
                        if node.args else None)
@@ -14118,7 +14342,8 @@ class Transpiler:
                         self.coerce_to("char*", node.args[1],
                                        self.expr(node.args[1])))
             if isinstance(func.value, ast.Name) \
-                    and func.value.id in self._regex_dyn_vars:
+                    and func.value.id in self._regex_dyn_vars \
+                    and self._regex_name_in_scope(func.value.id):
                 if func.attr in ("search", "match") and 1 <= len(node.args) <= 3:
                     anc = "1" if func.attr == "match" else "0"
                     txt = self.coerce_to("char*", node.args[0],
@@ -14171,8 +14396,42 @@ class Transpiler:
                     anc = "1" if func.attr == "match" else "0"
                     txt = self.coerce_to("char*", node.args[0],
                                          self.expr(node.args[0]))
-                    return "_re_search(AS_INT(%s), %s, %s)" % (
+                    return "_re_search(AS_INT(%s), %s, 0, %s)" % (
                         self.wrap_obj(func.value), txt, anc)
+                # `pat.match(text, pos)` / `pat.search(text, pos)`: a
+                # compiled pattern reached through a value of unknown
+                # origin (a function parameter, typically -- a module-level
+                # `X = re.compile(...)` would already have matched a
+                # scope-checked branch above). `pat` is `obj` here and
+                # could be *either* representation a compiled pattern gets:
+                # a translation-time matcher id (`OBJ_INT`) or a
+                # dynamically-compiled pattern (its own source text, an
+                # `OBJ_STR`) -- `_re_match_any` reads the tag and picks the
+                # right engine, the same way `_cre_sub_any` already does for
+                # a `re.sub` replacement reached the same way.
+                if func.attr in ("search", "match") and len(node.args) == 2:
+                    anc = "1" if func.attr == "match" else "0"
+                    txt = self.coerce_to("char*", node.args[0],
+                                         self.expr(node.args[0]))
+                    pos = self.coerce_to("int", node.args[1],
+                                         self.expr(node.args[1]))
+                    self._regex_dyn = True   # brings in _cre_at/_re_match_any
+                    return "_re_match_any(%s, %s, %s, %s)" % (
+                        self.wrap_obj(func.value), txt, pos, anc)
+                # `pat.finditer(text[, pos[, end]])`, same unknown-origin
+                # `pat` as above -- `_last_before` (`pat.finditer(scan, lo,
+                # at)`) and `_sub_flattened` (`pat.finditer(body_scan)`)
+                # each receive one through their own parameter this way.
+                if func.attr == "finditer" and 1 <= len(node.args) <= 3:
+                    txt = self.coerce_to("char*", node.args[0],
+                                         self.expr(node.args[0]))
+                    pos = (self.coerce_to("int", node.args[1],
+                                          self.expr(node.args[1]))
+                           if len(node.args) >= 2 else "0")
+                    end = self._re_endpos(node, 2)
+                    self._regex_dyn = True
+                    return "_re_finditer_any(%s, %s, %s, %s)" % (
+                        self.wrap_obj(func.value), txt, pos, end)
                 if func.attr == "group":
                     n_arg = node.args[0] if node.args else None
                     if n_arg is None:
@@ -14969,7 +15228,11 @@ class Transpiler:
         out.append("")
         # Same result shape as the specialized matchers: a LIST of captured
         # strings, so `if m:` and `m.group(n)` need no new runtime type.
-        out.append("static obj _cre_run(int slot, char* t, int anc) {")
+        out.append("/* `pos` starts the search there while `t` stays the whole")
+        out.append(" * subject -- crust_re_exec_from, not crust_re_exec over")
+        out.append(" * `t + pos`, for the same reason _cre_at uses it: a")
+        out.append(" * lookaround at `pos` still has to see what precedes it. */")
+        out.append("static obj _cre_run(int slot, char* t, long pos, int anc) {")
         out.append("    int caps[128];")
         out.append("    int ng, i, rc;")
         out.append("    obj m;")
@@ -14977,8 +15240,8 @@ class Transpiler:
         out.append("    _cre_init();")
         out.append("    ng = crust_re_ngroups(_cre_h[slot]);")
         out.append("    if (2 * (ng + 1) > 128) return OBJ_NONE;")
-        out.append("    rc = crust_re_exec(_cre_h[slot], t, strlen(t), anc,")
-        out.append("                       caps, 2 * (ng + 1));")
+        out.append("    rc = crust_re_exec_from(_cre_h[slot], t, strlen(t), pos, anc,")
+        out.append("                            caps, 2 * (ng + 1));")
         out.append("    if (rc != CRUST_RE_MATCH) return OBJ_NONE;")
         out.append("    m = list_new();")
         out.append("    for (i = 0; i <= ng; i++)")
@@ -15105,6 +15368,63 @@ class Transpiler:
         out.append("        list_append(m, OBJ_INT(caps[2*i+1]));")
         out.append("    }")
         out.append("    return m;")
+        out.append("}")
+        out.append("")
+        out.append("/* A compiled pattern reached through a value of unknown")
+        out.append(" * origin (typically a function parameter) rather than a")
+        out.append(" * name py2c can trace back to its own `re.compile(...)`:")
+        out.append(" * could be either representation a compiled pattern gets,")
+        out.append(" * a translation-time matcher id (T_INT) or a dynamically-")
+        out.append(" * compiled pattern (T_STR, its own source text) -- read")
+        out.append(" * the tag and use the matching engine, the same way")
+        out.append(" * _cre_sub_any already does for a re.sub replacement")
+        out.append(" * reached the same way. */")
+        # `_re_search`'s real definition is assembled elsewhere (it needs
+        # every compiled pattern's id, known only once the whole module has
+        # been walked) and spliced in near the top of the file -- but after
+        # this point in emission order, so C sees this call before that
+        # definition without a prototype here first.
+        out.append("static obj _re_search(long id, char* t, long pos, int anc);")
+        out.append("static obj _re_match_any(obj pat, char* t, long pos, int anc) {")
+        out.append("    if (pat.tag == T_INT) return _re_search(pat.u.i, t, pos, anc);")
+        out.append("    return _cre_at(AS_STR(pat), t, (int)pos, -1, anc);")
+        out.append("}")
+        out.append("")
+        out.append("/* `pat.finditer(text[, pos[, end]])` for the same")
+        out.append(" * unknown-origin `pat` -- built on `_re_match_any` rather")
+        out.append(" * than a from-scratch loop, so the two never disagree on")
+        out.append(" * what a single step finds. The specialized/VM engines")
+        out.append(" * behind a T_INT id take no `end` bound of their own (they")
+        out.append(" * are only ever reached with one here already: no caller")
+        out.append(" * threads a translation-time pattern through a parameter")
+        out.append(" * *and* an endpos), so a match starting at or past `end`")
+        out.append(" * simply ends the iteration rather than being sliced out")
+        out.append(" * up front the way the dynamic bridge's own end support")
+        out.append(" * does. */")
+        out.append("static obj _re_finditer_any(obj pat, char* t, long pos, long end) {")
+        out.append("    obj res = list_new();")
+        out.append("    long off, len;")
+        out.append("    if (!t) return res;")
+        out.append("    len = (long)strlen(t);")
+        out.append("    if (end >= 0 && end < len) len = end;")
+        out.append("    off = pos < 0 ? 0 : pos;")
+        out.append("    while (off <= len) {")
+        out.append("        obj m; long s, e;")
+        out.append("        if (pat.tag == T_INT) {")
+        out.append("            m = _re_search(pat.u.i, t, off, 0);")
+        out.append("            if (!IS_NONE(m) && end >= 0 && _re_span(m, 0, 0) >= end)")
+        out.append("                m = OBJ_NONE;")
+        out.append("        } else {")
+        out.append("            m = _cre_at(AS_STR(pat), t, (int)off,")
+        out.append("                        (int)(end >= 0 ? end : -1), 0);")
+        out.append("        }")
+        out.append("        if (IS_NONE(m)) break;")
+        out.append("        list_append(res, m);")
+        out.append("        s = _re_span(m, 0, 0);")
+        out.append("        e = _re_span(m, 0, 1);")
+        out.append("        off = (e == s) ? e + 1 : e;")
+        out.append("    }")
+        out.append("    return res;")
         out.append("}")
         out.append("")
         out.append("static obj _cre_finditer_at(char* pat, char* t, int pos, int end);")
@@ -16865,6 +17185,24 @@ class Transpiler:
         if isinstance(v, ast.BinOp) and isinstance(v.op, ast.Add):
             return "obj_add(%s, %s)" % (self.expr(v.left), self.expr(v.right))
         return self.expr(v)
+
+    def ex_Yield(self, node):
+        """`yield` reached as a sub-expression (`x = yield v`) rather than
+        a bare statement -- `st_Expr` handles the ordinary case. There is
+        no real "value sent back in" to return here (`.send()` is not
+        implemented), so this still does the one thing every consumer in
+        this codebase actually needs -- the value reaches the collected
+        list -- and hands back `OBJ_NONE` for whatever the assignment
+        target does with it. Silent-if-unreached is fine: nothing here
+        writes to that target."""
+        if self.cur_gen_var is not None:
+            val = "OBJ_NONE" if node.value is None else self.wrap_obj(node.value)
+            return "({ list_append(%s, %s); OBJ_NONE; })" % (
+                self.cur_gen_var, val)
+        self._warn_unsupported(
+            getattr(node, "lineno", 0), "expression of type Yield", "None",
+            "the expression is dropped, not evaluated")
+        return "OBJ_NONE"
 
     def ex_JoinedStr(self, node):
         fmt, exprs = [], []

@@ -587,6 +587,9 @@ testminipy:
 	if sh tools/rpy_lib/run_crust_re_py2c_test.sh test_lambda_closure_py2c.py >/tmp/lambda_closure_py2c.txt 2>&1; then echo "  ok    lambda closures: capture, self, sort key (cpython == py2c native)"; else echo "  FAIL  lambda closures (see /tmp/lambda_closure_py2c.txt)"; fail=1; fi; \
 	if sh tools/rpy_lib/run_crust_re_py2c_test.sh test_void_call_value_py2c.py >/tmp/void_call_py2c.txt 2>&1; then echo "  ok    void-returning mutator used as a value (cpython == py2c native)"; else echo "  FAIL  void call as value (see /tmp/void_call_py2c.txt)"; fail=1; fi; \
 	if sh tools/rpy_lib/run_crust_re_py2c_test.sh test_str_index_py2c.py >/tmp/str_index_py2c.txt 2>&1; then echo "  ok    s.index(x) vs list.index(x) (cpython == py2c native)"; else echo "  FAIL  str/list .index() dispatch (see /tmp/str_index_py2c.txt)"; fail=1; fi; \
+	if sh tools/rpy_lib/run_crust_re_py2c_test.sh test_re_scope_py2c.py >/tmp/re_scope_py2c.txt 2>&1; then echo "  ok    per-scope regex pattern tracking (cpython == py2c native)"; else echo "  FAIL  per-scope regex pattern tracking (see /tmp/re_scope_py2c.txt)"; fail=1; fi; \
+	if sh tools/rpy_lib/run_crust_re_py2c_test.sh test_generator_py2c.py >/tmp/generator_py2c.txt 2>&1; then echo "  ok    yield as eager list collection (cpython == py2c native)"; else echo "  FAIL  yield/generator lowering (see /tmp/generator_py2c.txt)"; fail=1; fi; \
+	if sh tools/rpy_lib/run_crust_re_py2c_test.sh test_open_missing_py2c.py >/tmp/open_missing_py2c.txt 2>&1; then echo "  ok    open() raises on a missing file (cpython == py2c native)"; else echo "  FAIL  open() missing-file exception (see /tmp/open_missing_py2c.txt)"; fail=1; fi; \
 	if [ $$fail = 0 ]; then echo "testminipy: PASS"; \
 	else echo "testminipy: FAIL"; fi; exit $$fail
 
