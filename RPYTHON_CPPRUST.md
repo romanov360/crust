@@ -28,7 +28,8 @@ python3 tools/rpy_census.py tools/cpprust.py --errors   # just the count
 | runs a translation end to end | no | **yes** |
 | translates a 3-line class correctly | no | **yes** |
 | exit code matches CPython's | — | **yes** |
-| output matches CPython on a class with fields | no | **no** (lambda-closure gap, see below) |
+| output matches CPython on a class with fields | no | **yes** |
+| real litehtml files: agree byte-for-byte / disagree | — | **14 / 0** (12 more fail natively, 17 CPython itself refuses — see below) |
 | calls substituted with `None` | 11 | 2 |
 | container advisories | 77 | 77 |
 
@@ -115,6 +116,9 @@ diffs stdout, so a fix that compiles but computes something else fails.
 | `test_rsplit_py2c.py` | `s.rsplit(sep, maxsplit)`, which is not `split` reversed |
 | `test_starred_ctor_py2c.py` | `Cls(a, b, *f())` — a non-leading `*expr` into a constructor |
 | `test_re_split_py2c.py` | `re.split(pat, text)`, the module function, not `str.split` |
+| `test_lambda_closure_py2c.py` | lambda closures: capture, a closure returned from its own creator, `self`, side effects, `.sort(key=...)` unaffected |
+| `test_void_call_value_py2c.py` | a void-returning mutator (`.append`, `.sort()`, `dict.update`) used as a value |
+| `test_str_index_py2c.py` | `s.index(x)` vs `list.index(x)` — same call shape, receiver decides |
 
 The edges are deliberate. A hand-written `str.count` gets the empty needle
 wrong (Python counts the gaps: `"abc".count("")` is 4), and a hand-written
@@ -216,18 +220,13 @@ of the four: a build that "runs and writes a file" is not evidence the file
 is right, and the census's error and substitution counts — both zero or
 near it throughout — did not move for any of them.
 
-## What is left
+## Lambdas: from "not lowered at all" to a working closure
 
 With (1)–(4) fixed, a class with a real base, secondary interface bases,
-an array field, and a body that reads its own fields now translates
-byte-identical to CPython's output (checked directly, not just "no crash").
-But **first-class lambdas are not lowered at all.** `ex_Lambda` — the
-general case, reached whenever a `lambda` is used as a *value* rather than
-inlined at a special-cased call site (`.sort(key=...)`, an immediately-
-invoked `(lambda: ...)( )`) — unconditionally returns
-`make_closure(&identity__tramp, OBJ_NONE)`: the identity function, no
-matter what the lambda's body says. `_emit_class`'s own field-qualification
-pass depends on exactly this:
+an array field, and a body that reads its own fields translated
+byte-identical to CPython's output — *except* any class with a field read
+or written unqualified in a method body, because `_emit_class`'s
+field-qualification pass runs its rewrite through a first-class lambda:
 
 ```python
 inner = _sub_code(
@@ -235,26 +234,120 @@ inner = _sub_code(
     lambda m: "this->" + info["paths"][m.group(1)], inner)
 ```
 
-`_sub_code` calls its `repl` argument through a first-class closure — so on
-this path, natively, `repl(m)` returns `m` itself (or rather, the identity
-closure applied to it), and the qualifier appends the raw match value —
-`['x', 'x', 8, 9, 8, 9]`, `_re_emit_build`'s internal list layout for the
-match, stringified — instead of `this->x`. Every class with a field read or
-written unqualified in a method body hits this; box.cpp's original repro
-didn't only because it has no fields, so `info["paths"]` was empty and the
-lambda-carrying branch never ran.
+and `ex_Lambda` — the general case, reached whenever a `lambda` is used as
+a *value* rather than inlined at a special-cased call site
+(`.sort(key=...)`, an immediately-invoked `(lambda: ...)( )`) —
+unconditionally returned `make_closure(&identity__tramp, OBJ_NONE)`: the
+identity function, no matter what the lambda's body said. Natively,
+`repl(m)` returned `m` itself, and the qualifier appended the raw match
+value — `['x', 'x', 8, 9, 8, 9]`, `_re_emit_build`'s internal list layout
+for the match, stringified — instead of `this->x`. box.cpp's original
+repro didn't hit this only because it has no fields.
 
-The other four bugs were each contained to one function or one call
-shape. This one is architectural: `convert_block_closures` (the pass that
-turns a block-nested `def` used as a value into a real closure, capturing
-free variables into an environment) has no `Lambda` case, and retrofitting
-one has to avoid breaking the call sites that already pattern-match a raw
-`ast.Lambda` node directly rather than going through `ex_Lambda`
-(`.sort(key=lambda...)`, an immediately-invoked lambda, `re.sub`'s
-function-replacement form) — those work today specifically *because*
-nothing has converted their `Lambda` node into something else first. That
-is next, and it is sized differently than (1)–(4): a code-generation
-feature, not a dispatch-order fix.
+**This is now implemented.** `ex_Lambda` builds a real closure: free
+variables the body reads out of the enclosing function (`self.scope`,
+plus `self` as a special case — a method's own receiver is never a
+`self.scope` entry) travel in a captured environment list, and a
+uniform-signature trampoline — registered when the lambda is lowered,
+emitted once every function body has been walked, the same two-pass
+structure `emit_trampolines` already used for closure-converted `def`s —
+unpacks env and args and evaluates the body. `.sort(key=lambda ...)` and
+every `re.sub` function-replacement call site in this tree never reach
+`ex_Lambda` at all (inlined, or naming a real function), so neither
+needed to change, and both were verified unaffected.
+
+Implementing it surfaced one more real gap on the way: a void-returning
+runtime mutator (`.append`, `.sort()`, `dict.update`, ...) used as a
+*value* has no lowering either — `value_ctype` has no case for these,
+because a bare statement never notices, but a lambda whose whole body is
+exactly one such call (a callback that exists purely for its side effect
+— `_monomorphise_uses`'s `record` parameter) needs its `None` back.
+Fixed the same way `_scalar_helper_ct` already handles the analogous
+scalar-helper problem: keyed on the emitted call, not the receiver's
+static type.
+
+## The first real difftest
+
+With lambdas working, the compiler was finally run where issue #16 was
+always going to have to prove itself: `cpprust_native` against
+cpython-`cpprust.py`, over the real 43-file litehtml corpus this repo
+already has checked out, not another synthetic repro.
+
+| | files |
+|---|---|
+| both sides translate, byte-identical output | **14** |
+| CPython itself refuses (subset gap, not a native bug) | 17 |
+| native fails where CPython succeeds | 12 |
+| both succeed but disagree | **0** |
+
+The bottom row is the one that matters most: not one file where both
+sides produced *output* disagreed. Every remaining gap is native either
+crashing or refusing something CPython accepts — visible, not silent.
+
+The refusals are `cpprust.py` doing its job (an overloaded free function,
+a virtual base, `auto` needing clang and rejected under `--no-clang`) and
+are not this issue's concern. The 12 native-only failures split into two
+groups:
+
+* **Seven crash with the identical signature** — `codepoint`, `el_li`,
+  `el_text`, `html`, `num_cvt`, `strtod`, `url` (plus `iterators.cpp`,
+  which was the one that first surfaced the (1)-through-(4) round: fixing
+  the `str.index`/`list.index` collision got it past that crash into this
+  same one). All seven die in `_cre_dyn_get`, handed a `char*` that is
+  actually a small integer reinterpreted as a pointer.
+
+  The cause is `cpp_auto.py`'s `_anchored_finditer(pat, text)`, called
+  with a compiled pattern (`_DECLARATOR`, `_FIELD`, `_INDEXER` — all
+  `re.compile(...)` module constants) reached through a *parameter*.
+  py2c tracks which names hold a compile-time-constant pattern by the
+  variable's own spelling (`_regex_var_pat`/`_regex_dyn_vars`, keyed on
+  the assignment `NAME = re.compile(...)` at the point it's made) — sound
+  for a name used directly, but `pat` inside `_anchored_finditer` is a
+  different name at a different scope, so the tracking doesn't see
+  through the call boundary. `pat.match(text, pos)` then unconditionally
+  lowers through the *dynamic* bridge (`AS_STR(pat)`, `_cre_dyn_get`),
+  and `pat` at runtime is actually `OBJ_INT(pid)` — the translation-time
+  compiler's own representation for a constant pattern, per the earlier
+  `re.compile` fast path (`return "OBJ_INT(%d)" % pid`). `AS_STR` on an
+  int-tagged `obj` reads the tag union's other arm: the integer,
+  reinterpreted as a pointer.
+
+  A full fix needs more than a dispatch-order change this time: the
+  translation-time engine (`_re_search(id, t, anc)`, dispatching to
+  either the specialized state machine `_re_pN` or the regex-VM slot
+  `_cre_run`) has no `pos` parameter at all — every match starts at
+  offset 0 — while `_anchored_finditer` calls `.match(text, start)` with
+  a real offset on every iteration but the first. Slicing the string at
+  the call site is not the fix this project already rejected for the
+  same shape (`pat.search(s, pos)` losing lookbehind context to
+  `text + pos` — see "One was a wrong answer" above); the honest fix
+  extends `_re_search`/`_re_pN`/`_cre_run` to take a start position the
+  way `crust_re_exec_from` already gives the dynamic bridge, and adds a
+  runtime dispatch on `pat`'s tag (`T_INT` vs `T_STR`) for the case a
+  compiled pattern arrives through a value of unknown origin. Sitting
+  behind that: `_anchored_finditer` is *also* the one generator function
+  (`yield`) anywhere in either file, and generators still have no
+  lowering — the crash happens on the pattern match, before either
+  `yield` is ever reached, so fixing the dispatch is necessary but not
+  sufficient; the values this function is supposed to produce still need
+  a lowering for `yield` itself -- not attempted yet. Every caller here
+  consumes the result with a plain `for m in ...:` run to exhaustion, so
+  "collect into a list and return that" is the tractable version of that
+  problem, not full coroutine semantics.
+
+* **Five report a plausible-looking but wrong `CppError`** — `context`,
+  `el_link`, `el_script`, `el_table`, and (past the crash above)
+  `iterators` again. Two shapes: `"shared_ptr_X owns a resource, and the
+  right-hand side is ... not ... a call returning one"` for
+  `get_document()`/`get_child()`-style accessors (`iterators`, `el_link`,
+  `el_table`), and `"X& return type is not in the C++ subset"` naming a
+  *function*, not a type, as `X` (`context`: `JS_Eval&`, from
+  `return JS_Eval(...)`, where `JS_Eval` is never declared anywhere in
+  litehtml itself — it's a QuickJS symbol this checkout has no header
+  for; `el_script` likewise). Reproduces with `--no-clang` too, so it is
+  not the clang-oracle gap below. Not yet isolated to a single cause the
+  way the crash above was — plausibly connected to each other, not yet
+  shown to be.
 
 Six calls still lower to `None`, and they are the whole remaining
 recognized-and-warned-about list:
@@ -269,12 +362,15 @@ recognized-and-warned-about list:
 
 ## What has not been measured yet
 
-Nothing here says the result is *faster*. The binary runs, but it does not
-yet agree with CPython on real input — litehtml's classes all have fields —
-so timing it would be timing the wrong program. The order is: lower
-first-class lambdas, difftest cpython-cpprust against native-cpprust over
-the 43-file litehtml corpus, then measure. Until that difftest passes, "it
-lowers and runs" is the only claim being made.
+Nothing here says the result is *faster*. 14 of 43 real files now agree
+byte-for-byte with CPython, and zero disagree where both succeed — real
+progress on "does it lower correctly," measured against real input this
+time, not a synthetic repro. But the corpus is not fully green: 12 files
+still fail natively where CPython succeeds (two root causes, both
+diagnosed above, neither fixed yet), so timing the binary now would still
+be timing a program that cannot yet process the whole corpus. The order
+is unchanged in kind, just further along: clear the two remaining
+divergence causes, get to 43/43, then measure.
 
 Two things worth knowing before that measurement is designed:
 
