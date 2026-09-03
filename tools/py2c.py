@@ -2046,6 +2046,19 @@ obj list_index(obj lst, obj v) {
         for (long i = 0; i < l->len; i++)
             if (obj_eq(l->data[i], v)) return OBJ_INT(i);
     }
+    /* A receiver whose *static* type py2c could not pin down to `char*`
+     * (a local assigned from a slice, most often -- `value_ctype` reports
+     * `obj` for every `x[a:b]`, string or list alike, since a slice's
+     * runtime tag isn't known at that point) still dispatches `.index()`
+     * here rather than to `str_find`, and at runtime it can be a T_STR
+     * value the abort below has no business seeing. Delegate to the same
+     * string search `str.index` already uses (`str_find`, T_STR case in
+     * `ex_Call`'s dispatch): a real list holding no match is still the
+     * caller's bug and stays fatal, but a string reaching the *list*
+     * runtime through an imprecise static type is not one. */
+    if (lst.tag == T_STR && v.tag == T_STR) {
+        return OBJ_INT(str_find(AS_STR(lst), AS_STR(v), false));
+    }
     fprintf(stderr, "list.index: value not found\n"); abort();
 }
 long list_count(obj lst, obj v) {  /* number of elements equal to v */
