@@ -1366,11 +1366,11 @@ def _check_unsupported(scan, path, rtti=False):
 
 
 class Member(object):
-    __slots__ = ("kind", "ret", "name", "params", "body", "line", "dim",
+    __slots__ = ("kind", "ret", "name", "params", "body", "line", "arrsuf",
                  "init", "virt", "pure", "outline", "definit",
                  "declared_only", "stat", "contracts")
 
-    def __init__(self, kind, ret, name, params, body, line, dim="",
+    def __init__(self, kind, ret, name, params, body, line, arrsuf="",
                  init=None, virt=False, pure=False):
         self.kind = kind          # "field" | "method" | "ctor" | "dtor"
         self.ret = ret
@@ -1378,7 +1378,17 @@ class Member(object):
         self.params = params
         self.body = body
         self.line = line
-        self.dim = dim            # array suffix on a field, e.g. "[10]"
+        # Array suffix on a field, e.g. "[10]" -- named `arrsuf` rather than
+        # the more obvious `dim` because py2c's naming-convention type
+        # oracle reads an unannotated `dim` as an *integer* (numeric-code
+        # convention: array rank/dimension count), and silently declared
+        # this string field `int`. Every write of "" then round-tripped
+        # through `int`-formatting -- an uninitialized/reused bit pattern
+        # rendered as a garbage-looking decimal glued onto the field name
+        # it followed (`int x1974693792;` for a plain `int x;`), the kind of
+        # defect that compiles clean and says nothing until the difftest
+        # catches the wrong output. `arrsuf` isn't in that name list.
+        self.arrsuf = arrsuf
         self.init = init or []    # ctor initializer list: [(field, args)]
         self.virt = virt          # declared `virtual`
         self.pure = pure          # `= 0`, so no implementation here
@@ -1801,7 +1811,7 @@ def _split_members(body, cname, line0, path="<cpp>"):
                 # field, not two.
                 decls = [d.strip() for d in _split_declarators(decl)
                          if d.strip()]
-                head0, dim0 = _split_array_dim(decls[0])
+                head0, arrsuf0 = _split_array_dim(decls[0])
                 first = head0.replace("*", " * ").split()
                 if len(first) < 2:
                     raise CppError("%scannot parse member %r in class %s"
@@ -1814,12 +1824,12 @@ def _split_members(body, cname, line0, path="<cpp>"):
                 base = " ".join(t for t in first[:-1] if t != "*")
                 for idx, one in enumerate(decls):
                     if idx == 0:
-                        parts, dim = first, dim0
+                        parts, arrsuf = first, arrsuf0
                     else:
                         # A later declarator carries only its own name, and
                         # its own stars: `int *p, q;` makes `p` a pointer
                         # and `q` an int, exactly as C says.
-                        headn, dim = _split_array_dim(one)
+                        headn, arrsuf = _split_array_dim(one)
                         parts = [base] + headn.replace("*", " * ").split()
                         if len(parts) < 2:
                             raise CppError(
@@ -1832,7 +1842,7 @@ def _split_members(body, cname, line0, path="<cpp>"):
                     # containing a `*` survives tokenising intact.
                     fname = parts[-1]
                     fm = Member("field", " ".join(parts[:-1]), fname,
-                                None, None, line0, dim)
+                                None, None, line0, arrsuf)
                     # An initialiser belongs to the declarator it was
                     # written on, which is the last one here.
                     fm.definit = definit if idx == len(decls) - 1 else None
@@ -1895,12 +1905,12 @@ def _split_members(body, cname, line0, path="<cpp>"):
                 j += 1
             if j < n and body[j] == ";":
                 i = j + 1
-            fname, dim = bm.group(2), ""
+            fname, arrsuf = bm.group(2), ""
             b = fname.find("[")
             if b >= 0:
-                fname, dim = fname[:b], fname[b:]
+                fname, arrsuf = fname[:b], fname[b:]
             fm = Member("field", bm.group(1).strip(), fname, None, None,
-                        line0, dim)
+                        line0, arrsuf)
             # `""` rather than `None`: `T x {};` is value-initialisation,
             # which is a request, and telling it from "no initializer at
             # all" is the difference between zeroing the member and leaving
@@ -5244,7 +5254,7 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
     # (`template<typename T, int N>` with a field `T buf[N];`) appears only
     # in the declarator suffix, and leaving it alone would emit `[N]` with
     # no `N` in scope.
-    parts.extend("%s %s%s;" % (sub(f.ret), f.name, sub(f.dim))
+    parts.extend("%s %s%s;" % (sub(f.ret), f.name, sub(f.arrsuf))
                  for f in fields)
     for a in anons:
         parts.append(("%s { %s } %s;"
@@ -5319,7 +5329,7 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
         info["fields"][f.name] = (b, is_ptr)
         # An own field shadows an inherited one of the same name.
         info["paths"][f.name] = f.name
-        if b in known and not is_ptr and not f.dim:
+        if b in known and not is_ptr and not f.arrsuf:
             value_members.append((f.name, b))
     # A *named* member of an anonymous type is a field like any other, and a
     # body writing `u.a` means `this->u.a`. Its own type has no name to
@@ -6256,7 +6266,7 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
         elif base:
             lines.append("this->_base = o->_base;")
         for f in fields:
-            if f.dim:
+            if f.arrsuf:
                 continue                 # an array member is not assignable
             lines.append("__cpp_copy(%s, this->%s, &o->%s);"
                          % (info["fields"].get(f.name, ("", False))[0]
@@ -13021,7 +13031,15 @@ def _parse_owning(spec):
     return out
 
 
-def main():
+def main() -> int:
+    # `-> int` matters for the native build: every path here returns a
+    # plain int, but py2c's return-type inference falls back to the boxed
+    # `obj` for an unannotated function, and an `obj`-returning `main` is a
+    # C ABI mismatch -- the real process exit code ends up reading whatever
+    # bytes of the boxed value land where the caller expects a plain int,
+    # not the 0/1/2 this function actually returns. `-> int` gives py2c the
+    # answer directly rather than leaving it to infer.
+    #
     # Reads `sys.argv` here rather than taking the list as a parameter. Both
     # spellings are the same under CPython, but only this one lowers: py2c
     # gives `main` the C `(int argc, char** argv)` signature exactly when it

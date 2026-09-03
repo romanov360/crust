@@ -9559,6 +9559,24 @@ class Transpiler:
         if self._uses_argv(node):
             self.scope["argc"] = "int"
             self.scope["argv"] = "char**"
+            if ret == OBJ:
+                # This `main` becomes the real C process entry point (see
+                # `func_signature`/`_uses_argv`), whose return value the
+                # OS reads as a plain `int` -- but with no `-> int`
+                # annotation, an untyped function falls back to the boxed
+                # `obj`, and returning that where an int is expected is an
+                # ABI mismatch: only part of the boxed value lands where
+                # the caller expects an exit code, so the process exits
+                # with whatever bit pattern happened to be there rather
+                # than the 0/1/2 the source actually returns. Silent --
+                # the file this `main` writes can still be exactly right
+                # while the exit code is garbage. Annotate `-> int`.
+                self._warn(node.lineno,
+                           "main() takes argv but has no '-> int' return "
+                           "annotation, so it returns the boxed obj -- and "
+                           "an obj-returning main() is a C ABI mismatch: "
+                           "the process exit code will not be the int this "
+                           "function returns. Annotate 'def main() -> int:'")
         params = self.param_list(node, skip_self=False)
         plist = ", ".join(params) if params else "void"
         clauses, body = self._extract_contracts(node)
@@ -10481,7 +10499,7 @@ class Transpiler:
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
                 and isinstance(node.func.value, ast.Name) \
                 and node.func.value.id == "re" \
-                and node.func.attr in ("finditer", "findall"):
+                and node.func.attr in ("finditer", "findall", "split"):
             return OBJ
         # `re.sub(...)` at module level lowers to `_cre_sub`, which returns a
         # C string -- the same type the `pat.sub` method form above reports.
@@ -12372,26 +12390,107 @@ class Transpiler:
         parts += [str(len(wvar))] + wvar
         return "%s(%s)" % (self.fnsym(fn), ", ".join(parts))
 
-    def _lower_starred_local_call(self, fn, fndef, node):
-        """Expand `f(*seq, ...)` when `f` is a module-local function."""
-        if not node.args or not isinstance(node.args[0], ast.Starred):
+    def _split_single_starred(self, args):
+        """If exactly one of `args` is `*expr`: `(index, before, star_val,
+        after)`. Else None -- callers that only handle one Starred bail
+        rather than guess at `f(*a, *b)`."""
+        idx = [i for i, a in enumerate(args) if isinstance(a, ast.Starred)]
+        if len(idx) != 1:
             return None
-        star_val = node.args[0].value
-        rest = node.args[1:]
-        nparams = len(fndef.args.args)
-        nkw = len([k for k in node.keywords if k.arg])
-        npos = max(0, nparams - len(rest) - nkw)
-        if npos < 0:
+        i = idx[0]
+        return i, args[:i], args[i].value, args[i + 1:]
+
+    def _coerce_obj_rendered(self, target, rendered):
+        """Coerce an expression already known to yield `obj` -- an unpacked
+        `*expr` element, read out with `subscript()` -- to `target`'s C
+        type. Same rules as `coerce_to`'s obj-valued branch, without
+        needing that source's AST node: there isn't one, `subscript()`
+        built this expression rather than lowering one."""
+        if not target or target == OBJ:
+            return rendered
+        if target.endswith("*"):
+            if target == "char*":
+                return "AS_STR(%s)" % rendered
+            _tc = target[:-1]
+            if _tc not in self.classes:
+                self._load_xclass_anywhere(_tc)
+                if _tc in self.xclasses:
+                    self.xstructs_needed.add(_tc)
+                    target = self.xcsym(_tc) + "*"
+            return "(%s)AS_OBJ(%s)" % (target, rendered)
+        if target == "int":
+            return "AS_INT(%s)" % rendered
+        if target == "bool":
+            return "truthy(%s)" % rendered
+        if target in ("double", "float"):
+            return "AS_FLOAT(pyfloat(%s))" % rendered
+        return rendered
+
+    def _lower_starred_args(self, args, nparams, param_ctypes):
+        """Expand a single `*expr` positional argument -- anywhere in
+        `args`, not only first -- into exactly `nparams` coerced C argument
+        expressions.
+
+        `expr` is evaluated once into a temp shared by every unpacked slot:
+        it may be an arbitrary call (`*_parse_base(...)`), not just a bare
+        name, and the previous version of this (which only handled a
+        *leading* star) inlined the star expression's source text once per
+        slot subscripted -- fine for a name, but a call got re-run that many
+        times over. A non-leading star had no handling at all: the call
+        fell through to the generic path, which lowers `*expr` alone (not
+        as part of a larger arg list) to `expr`'s own value with no
+        unpacking, silently handing a whole tuple to a single parameter and
+        padding the rest from that parameter's default -- see the `Class(*
+        _parse_base(...))` fix this exists for.
+
+        Returns `(prelude, cargs)`, or None when `args` holds anything
+        other than exactly one Starred. `prelude`, when not None, is a C
+        statement that must run immediately before whatever consumes
+        `cargs` -- splice the result into a GNU statement expression:
+        `({ %sCALL(%s); })" % (prelude, ", ".join(cargs))`.
+        """
+        split = self._split_single_starred(args)
+        if split is None:
             return None
+        _, before, star_val, after = split
+        npos = max(0, nparams - len(before) - len(after))
         star_expr = self.expr(star_val)
-        unpacked = ["subscript(%s, OBJ_INT(%d))" % (star_expr, i)
-                    for i in range(npos)]
-        merged = list(unpacked) + list(rest)
+        if isinstance(star_val, ast.Name):
+            tmp, prelude = star_expr, None
+        else:
+            self._list_tmp = getattr(self, "_list_tmp", 0) + 1
+            tmp = "_st%d" % self._list_tmp
+            prelude = "obj %s = %s; " % (tmp, star_expr)
+        cargs = []
+        for k, a in enumerate(before):
+            t = param_ctypes[k] if param_ctypes and k < len(param_ctypes) \
+                else None
+            cargs.append(self.coerce_to(t, a, self.expr(a)))
+        for k in range(npos):
+            i = len(before) + k
+            t = param_ctypes[i] if param_ctypes and i < len(param_ctypes) \
+                else None
+            cargs.append(self._coerce_obj_rendered(
+                t, "subscript(%s, OBJ_INT(%d))" % (tmp, k)))
+        for k, a in enumerate(after):
+            i = len(before) + npos + k
+            t = param_ctypes[i] if param_ctypes and i < len(param_ctypes) \
+                else None
+            cargs.append(self.coerce_to(t, a, self.expr(a)))
+        return prelude, cargs
+
+    def _lower_starred_local_call(self, fn, fndef, node):
+        """Expand `f(..., *seq, ...)` when `f` is a module-local function."""
         if node.keywords:
-            merged = self._merge_keyword_args(fndef, merged, node.keywords)
-        defs = self.defaults_for(fndef, False)
-        cargs = self.coerce_args(self.func_params[fn], merged, defs)
-        return "%s(%s)" % (self.fnsym(fn), ", ".join(cargs))
+            return None            # the keyword-merge path handles this
+        nparams = len(fndef.args.args)
+        starred = self._lower_starred_args(
+            node.args, nparams, self.func_params[fn])
+        if starred is None:
+            return None
+        prelude, cargs = starred
+        call = "%s(%s)" % (self.fnsym(fn), ", ".join(cargs))
+        return "({ %s%s; })" % (prelude, call) if prelude else call
 
     def _sort_with_key(self, func, node):
         """Lower ``LIST.sort(key=lambda P: BODY[, reverse=R])`` to an inline
@@ -13128,6 +13227,16 @@ class Transpiler:
                         return "%s_new(0)" % ci.csym
                     return "%s_new(%d, %s)" % (
                         ci.csym, len(wrapped), ", ".join(wrapped))
+                if init and not node.keywords and \
+                        any(isinstance(a, ast.Starred) for a in node.args):
+                    nparams = len(init.args.args) - 1     # exclude self
+                    starred = self._lower_starred_args(
+                        node.args, nparams, self.init_param_ctypes(ci))
+                    if starred:
+                        prelude, cargs = starred
+                        call = "%s_new(%s)" % (ci.csym, ", ".join(cargs))
+                        return "({ %s%s; })" % (prelude, call) \
+                            if prelude else call
                 defs = self.defaults_for(init, True) if init else None
                 merged = self._merge_keyword_args(init, node.args,
                                                   node.keywords, True) \
@@ -13435,9 +13544,16 @@ class Transpiler:
             if func.attr == "reverse" and not node.args and \
                     func.attr not in self.method_owners:
                 return "list_reverse(%s)" % self.wrap_obj(func.value)
-            # string methods (guard against user methods of the same name)
+            # string methods (guard against user methods of the same name,
+            # and against a module whose own function shares the name -- a
+            # bare receiver-name check can't tell `expr.split(...)` from
+            # `re.split(...)`, and `re.split` has two positional args where
+            # a string's `.split(sep)` takes at most one: the first became
+            # `sep` and the text to actually split was silently dropped.)
             if func.attr in self.STR_METHODS and \
-                    func.attr not in self.method_owners:
+                    func.attr not in self.method_owners and not (
+                        isinstance(func.value, ast.Name) and
+                        func.value.id in self.import_alias):
                 r = self.lower_str_method(func, node)
                 if r is not None:
                     return r
@@ -13592,6 +13708,14 @@ class Transpiler:
                             and len(node.args) == 2:
                         self._regex_dyn = True
                         return "_cre_findall(%s, %s)" % (
+                            self.coerce_to("char*", node.args[0],
+                                           self.expr(node.args[0])),
+                            self.coerce_to("char*", node.args[1],
+                                           self.expr(node.args[1])))
+                    if modname == "re" and func.attr == "split" \
+                            and len(node.args) == 2:
+                        self._regex_dyn = True
+                        return "_cre_split(%s, %s)" % (
                             self.coerce_to("char*", node.args[0],
                                            self.expr(node.args[0])),
                             self.coerce_to("char*", node.args[1],
@@ -14852,6 +14976,41 @@ class Transpiler:
         out.append("        if (caps[1] == caps[0]) off += caps[1] + 1;")
         out.append("        else off += caps[1];")
         out.append("    }")
+        out.append("    return res;")
+        out.append("}")
+        out.append("")
+        out.append("/* re.split(pat, t): each match -- found the same way finditer")
+        out.append(" * finds them, empty match included, advancing one byte past an")
+        out.append(" * empty one so it terminates -- becomes a split point with no")
+        out.append(" * further filtering. That is not obvious from the docs (an")
+        out.append(" * empty match \"adjacent to a previous split\" sounds like it")
+        out.append(" * should be suppressed) but matches CPython exactly, checked")
+        out.append(" * against it directly: `re.split(r'x*', 'abxxcxd')` keeps every")
+        out.append(" * one of finditer's seven matches, including the two adjacent")
+        out.append(" * empty ones, as its own split point. */")
+        out.append("static obj _cre_split(char* pat, char* t) {")
+        out.append("    obj res = list_new();")
+        out.append("    int caps[128];")
+        out.append("    crust_re* h;")
+        out.append("    long off = 0, len, last = 0, ms, me;")
+        out.append("    int ng, rc, i;")
+        out.append("    if (!pat || !t) return res;")
+        out.append("    h = _cre_dyn_get(pat);")
+        out.append("    ng = crust_re_ngroups(h);")
+        out.append("    if (2 * (ng + 1) > 128) return res;")
+        out.append("    len = (long)strlen(t);")
+        out.append("    while (off <= len) {")
+        out.append("        rc = crust_re_exec(h, t + off, (size_t)(len - off), 0,")
+        out.append("                           caps, 2 * (ng + 1));")
+        out.append("        if (rc != CRUST_RE_MATCH) break;")
+        out.append("        ms = off + caps[0]; me = off + caps[1];")
+        out.append("        list_append(res, _re_slice(t, last, ms));")
+        out.append("        for (i = 1; i <= ng; i++)")
+        out.append("            list_append(res, _re_slice(t, off + caps[2*i], off + caps[2*i+1]));")
+        out.append("        last = me;")
+        out.append("        off = (ms == me) ? me + 1 : me;")
+        out.append("    }")
+        out.append("    list_append(res, _re_slice(t, last, len));")
         out.append("    return res;")
         out.append("}")
         out.append("")
